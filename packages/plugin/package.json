@@ -1,0 +1,7 @@
+{
+  "name": "@figma-html-loop/plugin",
+  "version": "0.1.0",
+  "description": "Figma plugin assets for Figma HTML Loop.",
+  "main": "figma-plugin/code.js",
+  "license": "MIT"
+}

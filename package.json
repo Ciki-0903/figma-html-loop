@@ -1,0 +1,21 @@
+{
+  "name": "figma-html-loop-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One-product Figma and HTML round-trip workspace.",
+  "type": "commonjs",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm --workspace @figma-html-loop/bridge-engine run build && npm run sync-skill",
+    "doctor": "node packages/cli/bin/figma-html-loop.js doctor",
+    "start": "node packages/cli/bin/figma-html-loop.js start",
+    "plugin-path": "node packages/cli/bin/figma-html-loop.js plugin-path",
+    "sync-skill": "node scripts/sync-skill.js",
+    "check-sync": "node scripts/sync-skill.js --check",
+    "validate": "node --check packages/cli/bin/figma-html-loop.js && node --check packages/local-helper/src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "license": "MIT"
+}

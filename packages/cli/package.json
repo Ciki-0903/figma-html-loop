@@ -1,0 +1,9 @@
+{
+  "name": "figma-html-loop",
+  "version": "0.1.0",
+  "description": "CLI for Figma HTML Loop.",
+  "bin": {
+    "figma-html-loop": "bin/figma-html-loop.js"
+  },
+  "license": "MIT"
+}

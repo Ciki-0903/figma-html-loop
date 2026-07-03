@@ -1,0 +1,10 @@
+{
+  "name": "@figma-html-loop/local-helper",
+  "version": "0.1.0",
+  "description": "Local helper that connects the Figma plugin, bridge engine, and round-trip layer.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "license": "MIT"
+}

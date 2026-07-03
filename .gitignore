@@ -1,0 +1,15 @@
+node_modules/
+dist/
+output/
+temp/
+debug/
+.DS_Store
+*.log
+
+# Generated export output (rebuilt on each Figma export; includes archives + assets)
+figma-html-loop-export/
+
+# Transient working artifacts
+html-capture.json
+figma-patch.json
+*.tmp

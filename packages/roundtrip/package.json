@@ -1,0 +1,7 @@
+{
+  "name": "@figma-html-loop/roundtrip",
+  "version": "0.1.0",
+  "description": "HTML capture, diff, and Figma patch helpers for Figma HTML Loop.",
+  "main": "src/index.js",
+  "license": "MIT"
+}

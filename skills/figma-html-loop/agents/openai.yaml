@@ -1,0 +1,4 @@
+interface:
+  display_name: "Figma HTML Loop"
+  short_description: "Loop Figma designs through HTML"
+  default_prompt: "Use $figma-html-loop to export a Figma selection to HTML, edit it, and send approved changes back to Figma."

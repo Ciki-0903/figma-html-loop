@@ -1,0 +1,384 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        margin: 0;
+        padding: 16px;
+        font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--figma-color-text, #111);
+        background: var(--figma-color-bg, #fff);
+      }
+      .row { margin-bottom: 12px; }
+      .status { font-weight: 600; }
+      .ok { color: #0a7f35; }
+      .bad { color: #b00020; }
+      .muted { color: var(--figma-color-text-secondary, #666); }
+      button {
+        width: 100%;
+        height: 36px;
+        border: 1px solid var(--figma-color-border, #ccc);
+        border-radius: 6px;
+        background: var(--figma-color-bg-brand, #18a0fb);
+        color: var(--figma-color-text-onbrand, #fff);
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: var(--figma-color-bg-secondary, #f2f2f2);
+        color: var(--figma-color-text, #111);
+      }
+      .hint { color: var(--figma-color-text-secondary, #666); line-height: 1.4; }
+      .selection { line-height: 1.4; }
+      .preview { line-height: 1.6; padding: 8px 10px; border-radius: 6px; background: var(--figma-color-bg-secondary, #f2f2f2); }
+      .pill { display: inline-block; padding: 1px 6px; border-radius: 10px; font-weight: 600; margin-right: 4px; }
+      .pill-add { background: #e4f6ea; color: #0a7f35; }
+      .pill-upd { background: #e6f0fb; color: #1a63c4; }
+      .pill-del { background: #fbe6e6; color: #b00020; }
+      button:disabled { opacity: 0.4; cursor: default; }
+      button.warn { background: #b00020; }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      Local helper: <span id="status" class="status">Checking...</span>
+    </div>
+    <div class="row muted">Plugin version: <span id="version">…</span></div>
+    <div class="row selection" id="selection">Select one Frame or component.</div>
+    <div class="row">
+      <button id="export">Export Selection</button>
+    </div>
+    <div class="row preview" id="preview">No patch waiting.</div>
+    <div class="row">
+      <button id="applyPending" disabled>Apply Pending Patch</button>
+    </div>
+    <div class="hint" id="message">Keep the local helper running while using this plugin.</div>
+
+    <script>
+      const helper = "http://localhost:7800";
+      // Must match PLUGIN_VERSION in code.js. Bump both together on every change.
+      const EXPECTED_VERSION = "roundtrip-1.0";
+      const statusEl = document.getElementById("status");
+      const selectionEl = document.getElementById("selection");
+      const messageEl = document.getElementById("message");
+      const previewEl = document.getElementById("preview");
+      const versionEl = document.getElementById("version");
+      const applyBtn = document.getElementById("applyPending");
+      let applyingPatch = false;
+      let pendingImageExportResolve = null;
+      let pendingPatchData = null;   // patch awaiting user approval
+      let deleteConfirmArmed = false;
+      versionEl.textContent = "expected " + EXPECTED_VERSION + " · loading…";
+
+      async function checkHelper() {
+        try {
+          const res = await fetch(helper + "/health", { cache: "no-store" });
+          if (!res.ok) throw new Error("not ok");
+          const text = await res.text();
+          if (text.trim().toLowerCase() !== "ok") throw new Error("bad body");
+          statusEl.textContent = "Connected";
+          statusEl.className = "status ok";
+        } catch (error) {
+          statusEl.textContent = "Offline";
+          statusEl.className = "status bad";
+        }
+      }
+
+      document.getElementById("export").onclick = () => {
+        messageEl.textContent = "Preparing export...";
+        parent.postMessage({ pluginMessage: { type: "confirm-selection" } }, "*");
+      };
+
+      applyBtn.onclick = () => { applyStoredPatch(); };
+
+      function summarize(patch) {
+        const s = { creates: 0, updates: 0, deletes: 0, deleteIds: [], page: patch && patch.page && patch.page.create ? patch.page.name : null };
+        for (const op of (patch && patch.operations) || []) {
+          if (op.action === "delete") { s.deletes++; s.deleteIds.push(op.id); }
+          else if (op.action === "update") s.updates++;
+          else s.creates++;
+        }
+        return s;
+      }
+
+      function renderPreview() {
+        deleteConfirmArmed = false;
+        applyBtn.classList.remove("warn");
+        if (!pendingPatchData) {
+          previewEl.textContent = "No patch waiting.";
+          applyBtn.disabled = true;
+          applyBtn.textContent = "Apply Pending Patch";
+          return;
+        }
+        const s = summarize(pendingPatchData);
+        let html = "";
+        if (s.page) html += "<div>New page: <b>" + escapeHtml(s.page) + "</b></div>";
+        html += '<div><span class="pill pill-add">+ ' + s.creates + " new</span>"
+              + '<span class="pill pill-upd">~ ' + s.updates + " changed</span>"
+              + '<span class="pill pill-del">− ' + s.deletes + " deleted</span></div>";
+        if (s.deletes > 0) html += '<div class="muted">⚠ Will delete ' + s.deletes + " layer(s). Review before applying.</div>";
+        previewEl.innerHTML = html;
+        applyBtn.disabled = false;
+        applyBtn.textContent = s.deletes > 0 ? ("Apply (deletes " + s.deletes + ")") : "Apply Pending Patch";
+      }
+
+      function escapeHtml(v) {
+        return String(v == null ? "" : v).replace(/[&<>"]/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+        });
+      }
+
+      async function applyStoredPatch() {
+        if (applyingPatch || !pendingPatchData) return;
+        const s = summarize(pendingPatchData);
+        // Deletes require an explicit second click to confirm.
+        if (s.deletes > 0 && !deleteConfirmArmed) {
+          deleteConfirmArmed = true;
+          applyBtn.classList.add("warn");
+          applyBtn.textContent = "⚠ Confirm delete " + s.deletes + " — click again";
+          messageEl.textContent = "This patch deletes " + s.deletes + " layer(s). Click again to confirm.";
+          return;
+        }
+        applyingPatch = true;
+        applyBtn.disabled = true;
+        previewEl.textContent = "Applying patch (" + (pendingPatchData.operations || []).length + " operations)…";
+        try {
+          await resolvePatchImages(pendingPatchData);
+          parent.postMessage({ pluginMessage: { type: "apply-patch", patch: pendingPatchData } }, "*");
+        } catch (error) {
+          applyingPatch = false;
+          messageEl.textContent = "Could not prepare the patch.";
+        }
+      }
+
+      function requestMissingImages(ids) {
+        return new Promise((resolve) => {
+          pendingImageExportResolve = resolve;
+          parent.postMessage({ pluginMessage: { type: "export-missing-images", ids } }, "*");
+        });
+      }
+
+      function collectSvgItems(composition) {
+        const items = [];
+        function walk(node) {
+          if (!node || node.visible === false) return;
+          if (typeof node._svgContent === "string" && typeof node.svgId === "string" && node._svgContent) {
+            items.push({ id: node.svgId, data: node._svgContent });
+          }
+          if (Array.isArray(node.children)) node.children.forEach(walk);
+        }
+        if (composition && Array.isArray(composition.children)) composition.children.forEach(walk);
+        return items;
+      }
+
+      function cleanupSvgContent(composition) {
+        function walk(node) {
+          if (!node || typeof node !== "object") return;
+          delete node._svgContent;
+          delete node.svgContent;
+          if (Array.isArray(node.children)) node.children.forEach(walk);
+        }
+        if (composition && Array.isArray(composition.children)) composition.children.forEach(walk);
+      }
+
+      async function uploadAssets(msg) {
+        const imageIds = Array.isArray(msg.imageIds) ? msg.imageIds : [];
+        if (imageIds.length) {
+          let missing = imageIds;
+          try {
+            const check = await fetch(helper + "/api/images/check", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ids: imageIds })
+            });
+            if (check.ok) {
+              const data = await check.json();
+              missing = Array.isArray(data.missing) ? data.missing : [];
+            }
+          } catch (error) {}
+          if (missing.length) {
+            const exported = await requestMissingImages(missing);
+            const items = Array.isArray(exported && exported.items) ? exported.items : [];
+            if (items.length) {
+              await fetch(helper + "/api/images/batch", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ items })
+              });
+            }
+          }
+        }
+
+        const svgItems = collectSvgItems(msg.composition);
+        const svgIds = Array.from(new Set(svgItems.map((item) => item.id)));
+        if (svgIds.length) {
+          let missing = svgIds;
+          try {
+            const check = await fetch(helper + "/api/svgs/check", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ids: svgIds })
+            });
+            if (check.ok) {
+              const data = await check.json();
+              missing = Array.isArray(data.missing) ? data.missing : [];
+            }
+          } catch (error) {}
+          const toUpload = svgItems.filter((item) => missing.includes(item.id));
+          if (toUpload.length) {
+            await fetch(helper + "/api/svgs/batch", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ items: toUpload })
+            });
+          }
+        }
+        cleanupSvgContent(msg.composition);
+      }
+
+      async function exportAndOpenHtml() {
+        const res = await fetch(helper + "/api/export/html", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ open: false })
+        });
+        if (!res.ok) throw new Error("export failed");
+        return await res.json();
+      }
+
+      window.onmessage = async (event) => {
+        const msg = event.data && event.data.pluginMessage;
+        if (!msg) return;
+
+        if (msg.type === "plugin-version") {
+          const ok = msg.version === EXPECTED_VERSION;
+          versionEl.innerHTML = (ok ? "✅ " : "⚠️ ") + escapeHtml(msg.version)
+            + (ok ? " (up to date)" : " — expected " + EXPECTED_VERSION + ", re-import plugin");
+          versionEl.className = ok ? "ok" : "bad";
+          return;
+        }
+
+        if (msg.type === "selection-preview") {
+          const items = Array.isArray(msg.selection) ? msg.selection : [];
+          if (!items.length) {
+            selectionEl.textContent = "Select one Frame or component.";
+            return;
+          }
+          const first = items[0];
+          const size = first.width && first.height ? ` - ${Math.round(first.width)} x ${Math.round(first.height)}` : "";
+          selectionEl.textContent = `${first.name || "Untitled"} (${first.type})${size}`;
+        }
+
+        if (msg.type === "selection-error") {
+          messageEl.textContent = msg.message || "Please select a design first.";
+        }
+
+        if (msg.type === "selection-confirmed") {
+          try {
+            messageEl.textContent = "Saving assets, generating HTML, and opening it...";
+            await uploadAssets(msg);
+            const res = await fetch(helper + "/api/selection/confirm", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...msg, autoExport: false })
+            });
+            if (!res.ok) throw new Error("helper rejected selection");
+            const data = await exportAndOpenHtml();
+            const exported = data && (data.export || data.exported || data);
+            if (exported && exported.indexPath) {
+              if (exported.url) {
+                parent.postMessage({ pluginMessage: { type: "open-url", url: exported.url } }, "*");
+              }
+              messageEl.textContent = exported.url ? "HTML generated and opening in browser." : "HTML generated.";
+            } else {
+              messageEl.textContent = "Selection saved. You can return to the Agent.";
+            }
+          } catch (error) {
+            messageEl.textContent = "The local helper is not ready. Start it, then try again.";
+          }
+        }
+
+        if (msg.type === "export-missing-images:result") {
+          if (typeof pendingImageExportResolve === "function") {
+            pendingImageExportResolve({ items: Array.isArray(msg.items) ? msg.items : [] });
+            pendingImageExportResolve = null;
+          }
+        }
+
+        if (msg.type === "apply-patch-result") {
+          try {
+            await fetch(helper + "/api/apply/ack", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(msg.result)
+            });
+          } catch (error) {}
+          applyingPatch = false;
+          pendingPatchData = null;
+          const r = msg.result || {};
+          const c = r.counts || {};
+          if (r.rolledBack) {
+            previewEl.innerHTML = '<span class="pill pill-del">rolled back</span>';
+            messageEl.textContent = "Build failed and was rolled back — no partial page left. " + (r.fatal || (c.failed + " op(s) failed"));
+          } else {
+            previewEl.innerHTML = '<span class="pill pill-add">+' + (c.created || 0) + '</span>'
+              + '<span class="pill pill-upd">~' + (c.updated || 0) + '</span>'
+              + '<span class="pill pill-del">−' + (c.deleted || 0) + '</span>'
+              + (c.failed ? ' <span class="bad">' + c.failed + ' failed</span>' : '');
+            messageEl.textContent = r.ok ? "Changes applied in Figma." : "Applied with " + (c.failed || 0) + " failure(s).";
+          }
+          setTimeout(pollPending, 500);
+        }
+      };
+
+      // Poll for a queued patch and PREVIEW it. Never auto-applies — the user must
+      // click Apply (and confirm again for deletes). This is the approval gate.
+      async function pollPending() {
+        if (applyingPatch) return;
+        try {
+          const res = await fetch(helper + "/api/apply/pending", { cache: "no-store" });
+          const data = res.ok ? await res.json() : null;
+          const patch = data && data.patch;
+          const has = patch && Array.isArray(patch.operations) && patch.operations.length > 0;
+          pendingPatchData = has ? patch : null;
+          renderPreview();
+        } catch (error) {
+          // helper unreachable — leave current preview
+        }
+      }
+
+      // Patches reference images by id (small on the wire). Resolve them to base64
+      // here in the UI (which always has fetch) before handing the patch to code.js.
+      async function resolvePatchImages(patch) {
+        const cache = {};
+        async function toBase64(id) {
+          if (cache[id] !== undefined) return cache[id];
+          try {
+            const r = await fetch(helper + "/api/asset/image/" + encodeURIComponent(id), { cache: "force-cache" });
+            if (!r.ok) { cache[id] = ""; return ""; }
+            const buf = await r.arrayBuffer();
+            let bin = "";
+            const bytes = new Uint8Array(buf);
+            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+            cache[id] = btoa(bin);
+          } catch (_) { cache[id] = ""; }
+          return cache[id];
+        }
+        async function walk(op) {
+          if (op && op.imageId && !op.imageBase64) {
+            const b64 = await toBase64(op.imageId);
+            if (b64) op.imageBase64 = b64;
+          }
+          if (op && Array.isArray(op.children)) for (const c of op.children) await walk(c);
+        }
+        for (const op of patch.operations || []) await walk(op);
+      }
+
+      checkHelper();
+      setInterval(checkHelper, 3000);
+      setInterval(pollPending, 2000);
+      pollPending();
+    </script>
+  </body>
+</html>
