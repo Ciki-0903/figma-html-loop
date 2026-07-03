@@ -92,21 +92,52 @@ Figma 选区  ──导出──▶  HTML/CSS  ──编辑──▶  采集/对
 | `skills/figma-html-loop` | 给 Agent 用的 Skill(设计师友好话术 + 参考文档 + 插件资产副本) |
 | `scripts/`、`test/` | 构建/同步脚本与回归测试 |
 
-## 6. 快速开始
+## 6. 安装与第一次使用
+
+> **一句话安装**:克隆仓库 → `npm install && npm run build` 装依赖并构建引擎 → `npm run start` 启动本地 helper(端口 **7800**)→ 在 Figma 桌面版导入 `npm run plugin-path` 打印出的插件,面板显示 `✅ roundtrip-1.0` 即可。
+
+### 6.1 安装(首次)
 
 ```bash
-# 1. 构建引擎（首次）
-npm run build
-
-# 2. 启动本地 helper（端口 7800）
-npm run start
-
-# 3. 打印插件路径,去 Figma 导入
-npm run plugin-path
+git clone https://github.com/Ciki-0903/figma-html-loop.git
+cd figma-html-loop
+npm install          # 安装依赖
+npm run build        # 构建 Figma→HTML 引擎（生成 dist/，clone 后必跑一次）
+npm run start        # 启动本地 helper（端口 7800，保持运行）
+npm run plugin-path  # 打印 Figma 插件 manifest 路径
 ```
 
-在 **Figma 桌面版** → Plugins → Development → **Import plugin from manifest**,选打印出的 `manifest.json`。
-插件面板顶部会显示当前版本 `✅ roundtrip-1.0`,据此确认导入的是最新版本。
+在 **Figma 桌面版** → Plugins → Development → **Import plugin from manifest**,选打印出的 `manifest.json`。插件面板顶部显示 `✅ roundtrip-1.0` 即为最新版本。
+
+### 6.2 第一次使用(手动走一遍)
+
+1. 确认 helper 在跑:`node packages/cli/bin/figma-html-loop.js doctor`
+2. 在 Figma 里**选中一个 Frame/组件** → 打开插件 **Figma HTML Loop** → 点 **Export Selection**
+3. 导出:`node packages/cli/bin/figma-html-loop.js export` → 产物在 `figma-html-loop-export/`,浏览器打开 `http://localhost:7800/export/index.html`
+4. 改 HTML(颜色/文案/尺寸…)→ 采集 `... capture-stable` → 生成补丁 `... diff` → 应用 `... apply` → 在插件里点 **Apply** 确认
+5. 回 Figma 查看改动已同步
+
+### 6.3 给 AI Agent 的第一次使用(重点)
+
+本工具打包成一个 **Skill**(`skills/figma-html-loop/SKILL.md`),给 Claude Code / Codex 等 Agent 直接调用——**设计师只用自然语言表达意图,Agent 负责跑命令**。
+
+**接入方式**
+- **Claude Code**:把 `skills/figma-html-loop/` 放到 Agent 能发现 Skill 的目录(项目内的 skills 目录,或 `~/.claude/skills/`),Agent 会在用户说出触发词时自动加载。
+- **Codex / 其他 Agent**:让 Agent 先读 `skills/figma-html-loop/SKILL.md` 作为操作说明。所有能力都通过 **CLI(JSON 输出)+ 本地 HTTP(:7800)** 暴露,不依赖任何 Agent 的私有工具,跨 Agent 通用。
+
+**触发词**(Agent 据此判断走哪个场景):把 Figma 导出成 HTML、回流 / 改完写回 Figma、新增 / 删除图层、把这个 HTML / 这一屏还原成一个新的 Figma 页面……
+
+**Agent 的标准回路**(Agent 自己跑;人只需在 Figma 里点选 + 在插件里确认):
+
+```text
+doctor → 让用户选中 Frame 并在插件点 Export Selection
+       → export → (Agent 编辑 HTML) → capture-stable → diff
+       → 向用户总结补丁 → apply（用户在插件内点 Apply 确认）
+```
+
+命令入口:`node packages/cli/bin/figma-html-loop.js <cmd>`(未全局安装时)。回流补丁是**最小差分**(只含真正改动),Agent 无需人工筛选,直接把摘要给用户即可。
+
+> ⚠️ Agent **不能直接读写 Figma 画布**,所有画布操作必须经插件。因此"选中 Frame""点 Export Selection""点 Apply"这三步始终由用户在 Figma 里完成,Agent 负责其余全部。
 
 ## 7. CLI 命令
 
