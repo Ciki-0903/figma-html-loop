@@ -139,7 +139,7 @@ async function main() {
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
     json({
       ok: true,
-      commands: ["doctor", "start", "stop", "restart", "plugin-path", "wait-selection", "export", "exports", "capture", "capture-latest", "capture-stable", "diff", "build-page", "annotate-ids", "apply", "writeback"],
+      commands: ["doctor", "start", "stop", "restart", "plugin-path", "wait-selection", "export", "exports", "capture", "capture-latest", "capture-stable", "diff", "build-page", "annotate-ids", "apply", "sync", "verify", "writeback"],
       port
     });
   }
@@ -308,6 +308,89 @@ async function main() {
     const patchFile = argValue("--patch");
     if (!patchFile) json({ ok: false, message: "Missing --patch." }, 1);
     json(await request("POST", "/api/apply/request", { patchFile: path.resolve(patchFile) }));
+  }
+
+  // One-shot reflow: capture-stable → diff → queue for plugin approval.
+  // Defaults resolve against the project root so the command works from any cwd.
+  if (cmd === "sync") {
+    const manifest = path.resolve(argValue("--manifest", path.join(root, "figma-html-loop-export", "loop-manifest.json")));
+    const out = path.resolve(argValue("--out", path.join(root, "figma-patch.json")));
+    const timeout = Number(argValue("--timeout", "20")) * 1000;
+    if (!fs.existsSync(manifest)) json({ ok: false, message: `Manifest not found: ${manifest}. Run export first.` }, 1);
+
+    // 1) wait for the browser capture to settle
+    const deadline = Date.now() + timeout;
+    let capture = null, lastSig = null;
+    while (Date.now() < deadline) {
+      let data = null;
+      try { data = await request("GET", "/api/capture/latest"); } catch (_) {}
+      const created = data && Array.isArray(data.created) ? data.created.length : 0;
+      const nodes = data && data.nodes ? Object.keys(data.nodes).length : 0;
+      const sig = data ? String(data.capturedAt) + ":" + created + ":" + nodes : "";
+      if ((created > 0 || nodes > 0) && sig === lastSig) { capture = data; break; }
+      lastSig = sig;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (!capture) json({ ok: false, message: `Capture did not stabilize within ${timeout / 1000}s. Open http://localhost:${port}/export/index.html and retry.` }, 1);
+
+    // 2) diff against the export baseline
+    const diffResult = await request("POST", "/api/diff", { manifest, out });
+    const ops = diffResult && diffResult.patch && Array.isArray(diffResult.patch.operations) ? diffResult.patch.operations : [];
+    const counts = {
+      update: ops.filter((o) => o.action === "update").length,
+      create: ops.filter((o) => o.action === "create").length,
+      delete: ops.filter((o) => o.action === "delete").length,
+    };
+    if (!ops.length) json({ ok: true, synced: false, message: "No changes detected — nothing to apply.", counts });
+
+    // 3) queue for the plugin's approval gate
+    await request("POST", "/api/apply/request", { patchFile: out });
+    json({
+      ok: true,
+      synced: true,
+      counts,
+      patch: out,
+      message: `Patch queued (${counts.update} update / ${counts.create} create / ${counts.delete} delete). Confirm with Apply in the Figma plugin.`,
+    });
+  }
+
+  // Fidelity check: render the Figma node and the exported HTML side by side,
+  // pixel-compare them, and report a match percentage + diff image.
+  if (cmd === "verify") {
+    const nodeId = argValue("--node", "");
+    const out = path.resolve(argValue("--out", path.join(root, "figma-html-loop-export")));
+    const timeout = Number(argValue("--timeout", "60")) * 1000;
+    const threshold = argValue("--threshold", "");
+
+    const job = await request("POST", "/api/render/request", { nodeId, out });
+    const deadline = Date.now() + timeout;
+    let status = null;
+    while (Date.now() < deadline) {
+      try { status = await request("GET", "/api/render/status"); } catch (_) {}
+      if (status && status.figmaDone && status.htmlDone) break;
+      await new Promise((r) => setTimeout(r, 700));
+    }
+    if (!status || !status.figmaDone || !status.htmlDone) {
+      const waiting = [];
+      if (!status || !status.figmaDone) waiting.push("Figma render (keep the Figma HTML Loop plugin panel open)");
+      if (!status || !status.htmlDone) waiting.push(`HTML render (keep http://localhost:${port}/export/index.html open in the browser)`);
+      json({ ok: false, message: `Timed out waiting for: ${waiting.join(" and ")}.`, nodeId: job.nodeId }, 1);
+    }
+    const result = await request("POST", "/api/verify/compare", threshold !== "" ? { threshold: Number(threshold) } : {});
+    json({
+      ok: true,
+      nodeId: job.nodeId,
+      matchPct: result.matchPct,
+      mismatchPct: result.mismatchPct,
+      comparedSize: { width: result.width, height: result.height },
+      figmaSize: result.sizeA,
+      htmlSize: result.sizeB,
+      sizeMatch: result.sizeMatch,
+      figma: result.figma,
+      html: result.html,
+      diff: result.diff,
+      message: `还原度 ${result.matchPct}%（${result.mismatched}/${result.totalPixels} 像素不一致）。差异图: ${result.diff}`,
+    });
   }
 
   json({ ok: false, message: `Unknown command: ${cmd}` }, 1);

@@ -212,10 +212,64 @@ function applyContainerSemantics(node: FigmaNode, layout: LayoutInfo, hasWrapper
   }
 }
 
+// Express Figma constraints as CSS so the exported HTML responds to parent
+// resizes the way the design does. Geometry (numeric left/top/width/height)
+// is untouched — at export size the rendered pixels are identical, so the
+// capture/diff loop sees no difference.
+function applyConstraintCss(
+  layout: LayoutInfo,
+  node: FigmaNode,
+  parentSize: { width: number; height: number }
+): void {
+  const constraints = (node as any)?.constraints;
+  if (!constraints || typeof constraints !== 'object') return;
+  const pw = Number(parentSize.width);
+  const ph = Number(parentSize.height);
+  if (!(pw > 0 && ph > 0)) return;
+  const t2 = layout.transform2x2;
+  if (!(t2.a === 1 && t2.b === 0 && t2.c === 0 && t2.d === 1)) return; // rotated: keep plain left/top
+  if (typeof layout.left !== 'number' || typeof layout.top !== 'number') return;
+  if (typeof layout.width !== 'number' || typeof layout.height !== 'number') return;
+
+  const px = (v: number) => `${Math.round(v * 100) / 100}px`;
+  const pct = (v: number) => `${Math.round(v * 10000) / 100}%`;
+  const L = layout.left, T = layout.top, W = layout.width, H = layout.height;
+
+  const h = String(constraints.horizontal || 'MIN').toUpperCase();
+  if (h === 'MAX') {
+    layout.suppressLeft = true;
+    layout.cssRight = px(pw - L - W);
+  } else if (h === 'CENTER') {
+    layout.cssLeft = '50%';
+    layout.cssMarginLeft = px(L - pw / 2);
+  } else if (h === 'STRETCH') {
+    layout.cssRight = px(pw - L - W);
+    if (!layout.cssWidth) layout.cssWidth = 'auto';
+  } else if (h === 'SCALE') {
+    layout.cssLeft = pct(L / pw);
+    if (!layout.cssWidth) layout.cssWidth = pct(W / pw);
+  }
+
+  const v = String(constraints.vertical || 'MIN').toUpperCase();
+  if (v === 'MAX') {
+    layout.suppressTop = true;
+    layout.cssBottom = px(ph - T - H);
+  } else if (v === 'CENTER') {
+    layout.cssTop = '50%';
+    layout.cssMarginTop = px(T - ph / 2);
+  } else if (v === 'STRETCH') {
+    layout.cssBottom = px(ph - T - H);
+    if (!layout.cssHeight) layout.cssHeight = 'auto';
+  } else if (v === 'SCALE') {
+    layout.cssTop = pct(T / ph);
+    if (!layout.cssHeight) layout.cssHeight = pct(H / ph);
+  }
+}
+
 export function computeLayout(
   node: FigmaNode,
   parentAbs: number[][],
-  flags?: { asFlexItem?: boolean; parentAxes?: ReturnType<typeof getLayoutAxes>; parentAlignItemsCss?: string | undefined; parentWrap?: string; parentIsAutoLayout?: boolean }
+  flags?: { asFlexItem?: boolean; parentAxes?: ReturnType<typeof getLayoutAxes>; parentAlignItemsCss?: string | undefined; parentWrap?: string; parentIsAutoLayout?: boolean; parentSize?: { width: number; height: number } }
 ): { kind: 'frame' | 'shape' | 'text' | 'svg'; layout: LayoutInfo } {
   if (!node) throw new Error('computeLayout: node is null/undefined');
   const kind = determineKind(node);
@@ -319,6 +373,11 @@ export function computeLayout(
   // Why: ensure non-frame wrappers have a default centerStrategy
   if (kind !== 'frame' && layout.wrapper && !layout.wrapper.centerStrategy) {
     layout.wrapper.centerStrategy = 'translate';
+  }
+  // Constraint-aware positioning for absolute children (svg keeps its
+  // renderBounds-based placement untouched).
+  if (!flags?.asFlexItem && kind !== 'svg' && !layout.wrapper && flags?.parentSize) {
+    applyConstraintCss(layout, node, flags.parentSize);
   }
   // Snapshot any string-based node sizing into cssWidth/cssHeight for rendering，
   // 保持 width/height 仅承担几何层职责。

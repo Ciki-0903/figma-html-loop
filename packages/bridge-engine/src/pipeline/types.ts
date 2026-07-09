@@ -16,6 +16,19 @@ export type LayoutInfo = {
   position: 'absolute' | 'relative';
   left?: number;
   top?: number;
+  // Constraint-derived positioning overrides (absolute nodes only). The
+  // numeric left/top stay authoritative for geometry; these change how the
+  // position is EXPRESSED in CSS so it responds like the Figma constraints
+  // (right-pin, center-pin, stretch, scale). Rendered result is identical at
+  // export size.
+  cssLeft?: string;          // e.g. '50%' (CENTER) or '12.5%' (SCALE)
+  cssTop?: string;
+  cssRight?: string;         // MAX / STRETCH pin to the right edge
+  cssBottom?: string;
+  cssMarginLeft?: string;    // CENTER offset from the 50% anchor
+  cssMarginTop?: string;
+  suppressLeft?: boolean;    // MAX: right-pinned only, left stays auto
+  suppressTop?: boolean;
 
   // Flex item semantics
   flexGrow?: number;
@@ -72,6 +85,9 @@ export type RenderNodeIR = {
   svgContent?: string;
   svgFile?: string;
   text?: any;
+  // Component-instance semantics captured by the plugin (INSTANCE nodes):
+  // main component name, containing component-set name, variant properties.
+  componentMeta?: { name?: string; setName?: string; variant?: Record<string, string> };
 };
 
 export type Viewport = { width: number; height: number; offsetX: number; offsetY: number };
@@ -110,6 +126,9 @@ export type RenderBoxOptions = {
   mode?: 'content' | 'debug';
   hasStroke?: boolean;
   layoutOmit?: LayoutCssOmit;
+  // Extra data-* attributes on the rendered element (content mode only),
+  // e.g. component-instance semantics.
+  extraAttrs?: Record<string, string>;
 };
 export type RenderBoxConfig = {
   className: string;

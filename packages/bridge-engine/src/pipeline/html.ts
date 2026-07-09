@@ -130,8 +130,17 @@ function layoutToCss(layout: RenderNodeIR['layout'], omit?: LayoutCssOmit): {
   if (pos === 'absolute') {
     const l = typeof layout.left === 'number' ? layout.left : 0;
     const t = typeof layout.top === 'number' ? layout.top : 0;
-    if (!omit?.left) partsPos.push(`left:${fmtPx(l)};`);
-    if (!omit?.top) partsPos.push(`top:${fmtPx(t)};`);
+    // Constraint-derived overrides take precedence over plain px offsets.
+    if (!omit?.left && !layout.suppressLeft) {
+      partsPos.push(`left:${layout.cssLeft !== undefined ? layout.cssLeft : fmtPx(l)};`);
+    }
+    if (!omit?.top && !layout.suppressTop) {
+      partsPos.push(`top:${layout.cssTop !== undefined ? layout.cssTop : fmtPx(t)};`);
+    }
+    if (layout.cssRight !== undefined) partsPos.push(`right:${layout.cssRight};`);
+    if (layout.cssBottom !== undefined) partsPos.push(`bottom:${layout.cssBottom};`);
+    if (layout.cssMarginLeft !== undefined) partsPos.push(`margin-left:${layout.cssMarginLeft};`);
+    if (layout.cssMarginTop !== undefined) partsPos.push(`margin-top:${layout.cssMarginTop};`);
   }
 
   const partsSize: string[] = [];
@@ -398,6 +407,7 @@ function renderWrapperBox(cfg: RenderBoxConfig): string {
   const attrs: Record<string, string> = { class: outerClass, style: outer };
   if (opts?.mode === 'content') {
     attrs['data-figma-id'] = id;
+    if (opts?.extraAttrs) Object.assign(attrs, opts.extraAttrs);
   }
   if (opts?.mode === 'debug') attrs['data-layer-id'] = id;
   const innerAttrs: Record<string, string> = { class: innerClass + innerClassExtra, style: inner };
@@ -407,6 +417,20 @@ function renderWrapperBox(cfg: RenderBoxConfig): string {
   }
 
   return h('div', attrs, h('div', innerAttrs, innerContent));
+}
+
+// data-* attributes describing the component instance a node came from, so
+// agents editing the HTML can recognize repeated instances of one component.
+function componentAttrs(irNode?: { componentMeta?: { name?: string; setName?: string; variant?: Record<string, string> } }): Record<string, string> | undefined {
+  const meta = irNode?.componentMeta;
+  if (!meta) return undefined;
+  const out: Record<string, string> = {};
+  const component = meta.setName || meta.name;
+  if (component) out['data-figma-component'] = component;
+  if (meta.variant && Object.keys(meta.variant).length) {
+    out['data-figma-variant'] = Object.entries(meta.variant).map(([k, v]) => `${k}=${v}`).join(', ');
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 function renderSingleBox(cfg: RenderBoxConfig): string {
@@ -431,7 +455,10 @@ function renderSingleBox(cfg: RenderBoxConfig): string {
   const containerPart = opts?.mode === 'debug' ? cssSeg.containerCss : '';
   const style = `${baseStart}${sizeCss}${cleaned.css}${containerPart}`;
   const attrs: Record<string, string> = { class: className, style };
-  if (opts?.mode === 'content') attrs['data-figma-id'] = id;
+  if (opts?.mode === 'content') {
+    attrs['data-figma-id'] = id;
+    if (opts?.extraAttrs) Object.assign(attrs, opts.extraAttrs);
+  }
   if (opts?.mode === 'debug') attrs['data-layer-id'] = id;
   else if (opts?.mode === 'content' && opts?.hasStroke) attrs['data-layer-id'] = id;
   return h('div', attrs, innerContent);
@@ -515,7 +542,7 @@ async function renderFrameNode(ctx: RenderContext): Promise<string> {
     layout,
     boxCss,
     innerContent: innerHtml,
-    options: { outerOverflowVisible: true, innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, omitPosition, mode: ctx.mode, hasStroke, layoutOmit }
+    options: { outerOverflowVisible: true, innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, omitPosition, mode: ctx.mode, hasStroke, layoutOmit, extraAttrs: componentAttrs(ctx.irNode) }
   });
 }
 
@@ -610,7 +637,7 @@ async function renderTextNode(ctx: RenderContext): Promise<string> {
     layout: ctx.irNode.layout,
     boxCss,
     innerContent: textHtml,
-    options: { innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, omitPosition, mode: ctx.mode, hasStroke, layoutOmit }
+    options: { innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, omitPosition, mode: ctx.mode, hasStroke, layoutOmit, extraAttrs: componentAttrs(ctx.irNode) }
   });
 }
 
@@ -679,7 +706,7 @@ async function renderSvgNode(ctx: RenderContext): Promise<string> {
     layout: ctx.irNode.layout,
     boxCss: itemCss,
     innerContent: finalContentHtml,
-    options: { innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, mode: ctx.mode }
+    options: { innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, mode: ctx.mode, extraAttrs: componentAttrs(ctx.irNode) }
   });
 }
 
@@ -730,7 +757,7 @@ async function renderShapeNode(ctx: RenderContext): Promise<string> {
     layout: ctx.irNode.layout,
     boxCss,
     innerContent: '',
-    options: { innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, omitPosition, mode: ctx.mode, hasStroke }
+    options: { innerClassName: ctx.mode === 'debug' ? 'debug-box' : undefined, debugOverrideSize, omitPosition, mode: ctx.mode, hasStroke, extraAttrs: componentAttrs(ctx.irNode) }
   });
 }
 

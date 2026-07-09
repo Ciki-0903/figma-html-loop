@@ -34,7 +34,7 @@ Then check:
 node packages/cli/bin/figma-html-loop.js doctor
 ```
 
-Success means the helper is reachable at `http://localhost:7799`.
+Success means the helper is reachable at `http://localhost:7800`.
 
 ### 2. Find The Plugin File
 

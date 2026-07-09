@@ -58,7 +58,7 @@
     <script>
       const helper = "http://localhost:7800";
       // Must match PLUGIN_VERSION in code.js. Bump both together on every change.
-      const EXPECTED_VERSION = "roundtrip-1.0";
+      const EXPECTED_VERSION = "roundtrip-1.4";
       const statusEl = document.getElementById("status");
       const selectionEl = document.getElementById("selection");
       const messageEl = document.getElementById("message");
@@ -306,6 +306,19 @@
           }
         }
 
+        if (msg.type === "export-figma-render:result") {
+          try {
+            if (msg.requestId && msg.base64) {
+              await fetch(helper + "/api/render/figma", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: msg.requestId, base64: msg.base64 })
+              });
+            }
+          } catch (error) {}
+          renderInFlight = false;
+        }
+
         if (msg.type === "apply-patch-result") {
           try {
             await fetch(helper + "/api/apply/ack", {
@@ -345,6 +358,24 @@
           renderPreview();
         } catch (error) {
           // helper unreachable — leave current preview
+        }
+        pollRenderRequest();
+      }
+
+      // verify support: render a Figma node to PNG when the helper asks.
+      // Read-only (exportAsync), so no approval gate is needed.
+      let renderInFlight = false;
+      async function pollRenderRequest() {
+        if (renderInFlight) return;
+        try {
+          const res = await fetch(helper + "/api/render/pending", { cache: "no-store" });
+          const data = res.ok ? await res.json() : null;
+          const job = data && data.job;
+          if (!job) return;
+          renderInFlight = true;
+          parent.postMessage({ pluginMessage: { type: "export-figma-render", nodeId: job.nodeId, requestId: job.id } }, "*");
+        } catch (error) {
+          renderInFlight = false;
         }
       }
 

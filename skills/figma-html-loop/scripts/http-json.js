@@ -1,6 +1,6 @@
 const http = require("http");
 
-const port = Number(process.env.FIGMA_HTML_LOOP_PORT || 7799);
+const port = Number(process.env.FIGMA_HTML_LOOP_PORT || 7800);
 const host = "127.0.0.1";
 
 function request(method, path, body) {

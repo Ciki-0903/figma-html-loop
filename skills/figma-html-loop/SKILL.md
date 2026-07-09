@@ -42,7 +42,7 @@ This Skill is self-contained in product language: it uses the plugin and local h
 ### 场景 B ｜改样式回流到原图（HTML → Figma · 局部更新）
 - **触发词**：把 HTML 改的颜色/尺寸/位置/文案**同步回 Figma**、回流、反向同步、改完写回 Figma、sync back、update the original Figma。
 - **用法**：改导出的 HTML → 浏览器打开预览页 → `capture-stable`（或 `capture-latest`）→ `diff`（不带 `--manifest` 用最新采集）→ **先向用户总结补丁** → `apply`。
-- **能改什么**：文本、纯色/渐变、描边、阴影、四角圆角、opacity、字重/斜体/对齐/字间距/行高、位置/尺寸（按父级相对坐标比较,只对真正移动的图层产出位移）。
+- **能改什么**：文本、纯色/渐变（含多重渐变背景）、描边、阴影、四角圆角、opacity、混合模式、旋转、图片 cover/contain、字重/斜体/对齐/字间距/行高、auto-layout 的 gap/内边距/对齐、位置/尺寸（按父级相对坐标比较,只对真正移动的图层产出位移）。
 - **真差分**：`diff` 已逐属性对比导出基线,只产出**真正改动**的 op（自动滤掉未变属性、auto-layout 子节点位移、亚像素抖动)。改一个区块补丁就只含那个区块,**无需再人工筛选**;直接把补丁摘要给用户即可。
 
 ### 场景 C ｜新增图层（HTML → Figma · 新元素）
@@ -66,7 +66,8 @@ This Skill is self-contained in product language: it uses the plugin and local h
 2. **标注来源 HTML**：给每个要变成图层的元素加两个属性：
    - `data-figma-create="frame"`（容器/背景块/卡片）、`"text"`（文字）、`"image"`（`<img>`）；
    - `data-figma-name="图层名"`（Figma 图层面板显示名）。
-   - 结构按视觉层级嵌套即可（用真实布局，采集会读实际像素位置）；`display:flex` 会被翻成 Figma auto-layout。
+   - 结构按视觉层级嵌套即可（用真实布局，采集会读实际像素位置）；`display:flex` 和简单 `display:grid` 网格会被翻成 Figma auto-layout；内容撑开的容器自动推断为 hug 尺寸。
+   - 图标优先用**内联 `<svg>`**（标 `data-figma-create="svg"`）或让 CSS 背景 SVG 自动转矢量子层；「文本 + 行内胶囊」把容器标 frame 即可，直接文本会自动拆成独立 text 层；`margin:auto` 居中、`margin-left:auto` 行尾、`row-reverse` 都会按视觉结果自动推断。
 3. **注入稳定锚点**：`annotate-ids --html <文件>`（给每个 create 元素补 `data-figma-create-id`，供之后写回定位）。
 4. **注入采集脚本**：在 HTML 末尾加 `<script src="http://localhost:7800/figma-html-loop-capture.js"></script>`。
 5. **浏览器打开该 HTML**（`file://` 也可，脚本会自动把 DOM POST 给 helper）。
@@ -75,7 +76,7 @@ This Skill is self-contained in product language: it uses the plugin and local h
 7. **向用户总结**将新建的页面与图层数 → `apply`。插件收到后**先展示「+新增 ~修改 −删除」摘要,用户在插件里点 Apply 确认后**才新建该页并构建,其他页面不受影响。
 8. **闭环回写**（可选但推荐）：apply 成功后 `writeback --html <文件> --manifest-out ./loop-manifest.json` —— 把 Figma 分配的 id 写回 HTML 并生成 manifest。之后再改这一屏（改色/尺寸/文案）走场景 B（`capture-stable` → `diff --manifest ./loop-manifest.json` → `apply`），会**更新原图层**而不是重复创建。
 
-> 提醒：新建出的是普通 frame/text/image/vector 图层（非组件实例）。图片以内容 hash 引用,补丁保持轻量。插件更新后需让用户**重新导入插件**,并对照插件顶部显示的版本(`✅ roundtrip-1.0`)确认导入成功。
+> 提醒：新建出的是普通 frame/text/image/vector 图层（非组件实例）。图片以内容 hash 引用,补丁保持轻量。插件更新后需让用户**重新导入插件**,并对照插件顶部显示的版本(`✅ roundtrip-1.4`)确认导入成功。
 
 ## Parts
 
@@ -119,7 +120,10 @@ Use this flow:
 10. Build a patch from the capture and manifest.
 11. Summarize the patch and ask for approval.
 12. Apply the approved patch through the Figma plugin.
-13. Ask the user to inspect the result in Figma.
+13. Run `verify` to pixel-compare the Figma render with the HTML render and report the match percentage (needs the plugin panel open in Figma and the exported page open in a browser).
+14. Ask the user to inspect the result in Figma.
+
+> 提示：第 9-12 步可以用一条 `sync` 命令代替（等采集稳定 → 真差分 → 排队给插件确认）。
 
 Use these CLI names when available:
 
@@ -136,13 +140,17 @@ figma-html-loop diff --manifest ./figma-html-loop-export/loop-manifest.json --ou
 figma-html-loop build-page --page-name "新页面名" --cols 2 --out ./figma-patch.json --json   # 场景 E：外部 HTML → 新页面 / 批量网格
 figma-html-loop annotate-ids --html ./screen.html --json                            # 场景 E：写回前注入稳定 create-id
 figma-html-loop apply --patch ./figma-patch.json --json
+figma-html-loop sync --json                                                # 一键回流：capture-stable → diff → 排队（插件内确认）
+figma-html-loop verify --json                                              # 像素级还原度校验：Figma 渲染 vs HTML 渲染 → 匹配 % + diff.png
 figma-html-loop writeback --html ./screen.html --manifest-out ./loop-manifest.json --json  # 场景 E：apply 后回写 id + 生成 manifest（闭环）
 ```
 
 Scenario map:
-- A 导出 → `export`
-- B 局部回流 / C 新增 / D 删除 → `capture-stable` → `diff` → `apply`
+- A 导出 → `export` →（可选）`verify` 确认导出还原度
+- B 局部回流 / C 新增 / D 删除 → `sync`（或手动 `capture-stable` → `diff` → `apply`）→ 用户在插件确认 →（可选）`verify`
 - E 外部 HTML → 新页面 → `annotate-ids` → 注入采集脚本 → 浏览器打开 → `build-page` → `apply` →（闭环）`writeback`
+
+`verify` 的前提：Figma 里插件面板开着（负责渲染 Figma 侧 PNG）、浏览器里导出页开着（负责渲染 HTML 侧 PNG）。结果给出匹配百分比与 `verify/diff.png`（红色=不一致像素），把百分比与差异区域讲给用户即可。
 
 命令通过 `node packages/cli/bin/figma-html-loop.js <cmd>` 运行(未全局安装时)。首次可先 `npm run build` 构建引擎、`npm run start` 起 helper。
 

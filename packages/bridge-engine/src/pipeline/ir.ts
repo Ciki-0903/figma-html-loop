@@ -143,18 +143,96 @@ function collectStyle(
   return { boxCss, shouldInheritShadows: inherit, nodeHasFills: hasFills };
 }
 
+// Snapshot node-level text properties into the manifest baseline so the diff
+// can compare captured font metadata against exported values instead of
+// gating them behind "some other verified change". A property is only
+// baselined when it is uniform across all rich-text segments — mixed runs
+// have no single node-level truth to compare against.
+function buildRawTextStyle(node: FigmaNode) {
+  const text: any = (node as any)?.text;
+  if (!text || String(node?.type || '').toUpperCase() !== 'TEXT') return undefined;
+  const segments: any[] = Array.isArray(text.segments) ? text.segments : [];
+  if (!segments.length) return undefined;
+
+  const uniform = (get: (s: any) => any): any => {
+    const first = get(segments[0]);
+    if (first === undefined) return undefined;
+    for (let i = 1; i < segments.length; i++) {
+      if (JSON.stringify(get(segments[i])) !== JSON.stringify(first)) return undefined;
+    }
+    return first;
+  };
+
+  const out: any = {};
+  const fontSize = uniform((s) => (typeof s.fontSize === 'number' ? s.fontSize : undefined));
+  if (typeof fontSize === 'number') out.fontSize = fontSize;
+  const fontWeight = uniform((s) => (typeof s.fontWeight === 'number' ? s.fontWeight : undefined));
+  if (typeof fontWeight === 'number') out.fontWeight = fontWeight;
+  const family = uniform((s) => (s.fontName && typeof s.fontName.family === 'string' ? s.fontName.family : undefined));
+  if (family) out.fontFamily = family;
+  const styleName = uniform((s) => (s.fontName && typeof s.fontName.style === 'string' ? s.fontName.style : undefined));
+  if (typeof styleName === 'string') out.italic = /italic/i.test(styleName);
+
+  const letterSpacing = uniform((s) => s.letterSpacing);
+  if (letterSpacing && typeof letterSpacing.value === 'number') {
+    const unit = String(letterSpacing.unit || '').toUpperCase();
+    if (unit === 'PIXELS') out.letterSpacingPx = letterSpacing.value;
+    else if (unit === 'PERCENT' && typeof fontSize === 'number') out.letterSpacingPx = (letterSpacing.value / 100) * fontSize;
+  }
+  const lineHeight = uniform((s) => s.lineHeight);
+  if (lineHeight && typeof lineHeight.value === 'number') {
+    const unit = String(lineHeight.unit || '').toUpperCase();
+    if (unit === 'PIXELS') out.lineHeightPx = lineHeight.value;
+    else if (unit === 'PERCENT' && typeof fontSize === 'number') out.lineHeightPx = (lineHeight.value / 100) * fontSize;
+  }
+  // 'NONE' is a real baseline value: it lets the diff detect an added underline.
+  const decoration = uniform((s) => (typeof s.textDecoration === 'string' ? s.textDecoration : 'NONE'));
+  if (typeof decoration === 'string') out.textDecoration = decoration;
+  if (typeof text.textAlignHorizontal === 'string') out.textAlign = text.textAlignHorizontal;
+
+  return Object.keys(out).length ? out : undefined;
+}
+
+// Snapshot auto-layout container properties so the diff can reflow gap /
+// padding / alignment edits onto existing frames (same-direction only).
+function buildRawAutoLayout(node: FigmaNode) {
+  const n: any = node;
+  const mode = String(n?.layoutMode || 'NONE').toUpperCase();
+  if (mode !== 'HORIZONTAL' && mode !== 'VERTICAL') return undefined;
+  const out: any = {
+    mode,
+    itemSpacing: Number(n.itemSpacing) || 0,
+    paddingTop: Number(n.paddingTop) || 0,
+    paddingRight: Number(n.paddingRight) || 0,
+    paddingBottom: Number(n.paddingBottom) || 0,
+    paddingLeft: Number(n.paddingLeft) || 0,
+    primaryAxisAlignItems: String(n.primaryAxisAlignItems || 'MIN').toUpperCase(),
+    counterAxisAlignItems: String(n.counterAxisAlignItems || 'MIN').toUpperCase(),
+  };
+  if (n.layoutWrap === 'WRAP') out.layoutWrap = 'WRAP';
+  if (typeof n.counterAxisSpacing === 'number') out.counterAxisSpacing = n.counterAxisSpacing;
+  return out;
+}
+
 function buildRawStyle(node: FigmaNode) {
-  if (!node?.style) return undefined;
+  const textStyle = buildRawTextStyle(node);
+  const autoLayout = buildRawAutoLayout(node);
+  if (!node?.style && !textStyle && !autoLayout) return undefined;
+  const style = node?.style || ({} as any);
   return {
-    fills: node.style.fills,
-    strokes: node.style.strokes,
-    strokeWeights: node.style.strokeWeights || (Array.isArray(node.style.strokes) && node.style.strokes.length > 0 ? { t: 0, r: 0, b: 0, l: 0 } : undefined),
-    strokeAlign: node.style.strokeAlign,
-    dashPattern: (node.style as any).dashPattern,
-    effects: node.style.effects,
-    opacity: node.style.opacity,
-    blendMode: node.style.blendMode,
-    radii: (node.style as any).radii,
+    fills: style.fills,
+    strokes: style.strokes,
+    strokeWeights: style.strokeWeights || (Array.isArray(style.strokes) && style.strokes.length > 0 ? { t: 0, r: 0, b: 0, l: 0 } : undefined),
+    strokeAlign: style.strokeAlign,
+    dashPattern: (style as any).dashPattern,
+    // Always an array in new manifests: [] means "baselined as no effects",
+    // letting the diff detect added shadows; absence means "no baseline".
+    effects: Array.isArray(style.effects) ? style.effects : [],
+    opacity: style.opacity,
+    blendMode: style.blendMode,
+    radii: (style as any).radii,
+    textStyle,
+    autoLayout,
   } as any;
 }
 
@@ -172,7 +250,7 @@ export function nodeToIR(
   parentAbs: number[][],
   cssCollector: CssCollector,
   inheritedShadows?: ShadowEffect[] | null,
-  flags?: { asFlexItem?: boolean; parentAxes?: ReturnType<typeof getLayoutAxes>; parentAlignItemsCss?: string | undefined; parentWrap?: string }
+  flags?: { asFlexItem?: boolean; parentAxes?: ReturnType<typeof getLayoutAxes>; parentAlignItemsCss?: string | undefined; parentWrap?: string; parentSize?: { width: number; height: number } }
 ): RenderNodeIR {
   if (!node) throw new Error('nodeToIR called with null/undefined node');
   if (node.visible === false) throw new Error(`Invisible node ${node.id} should have been filtered upstream`);
@@ -199,5 +277,6 @@ export function nodeToIR(
     svgContent: node.svgContent,
     svgFile: svgFileProp,
     text: node.text,
+    componentMeta: (node as any).componentMeta || undefined,
   };
 }

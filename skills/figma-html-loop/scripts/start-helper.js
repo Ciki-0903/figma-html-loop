@@ -27,5 +27,5 @@ console.log(JSON.stringify({
   ok: true,
   message: "Local helper is starting.",
   pid: child.pid,
-  bridgeUrl: `http://localhost:${process.env.FIGMA_HTML_LOOP_PORT || 7799}`
+  bridgeUrl: `http://localhost:${process.env.FIGMA_HTML_LOOP_PORT || 7800}`
 }, null, 2));

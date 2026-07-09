@@ -1,6 +1,6 @@
 // Bump this on every plugin (code.js/ui.html) change so an import can be verified
 // as up to date. The UI compares its own expected version against this.
-const PLUGIN_VERSION = 'roundtrip-1.0';
+const PLUGIN_VERSION = 'roundtrip-1.4';
 
 figma.showUI(__html__, { width: 320, height: 300, themeColors: true });
 figma.ui.postMessage({ type: 'plugin-version', version: PLUGIN_VERSION });
@@ -483,6 +483,41 @@ async function collectNode(n, opts) {
     };
   }
   entry.clipsContent = n.clipsContent === true;
+  // Component-instance semantics: main component name, variant set + props.
+  // Read-only metadata for the export (data-figma-component / manifest).
+  if (n.type === 'INSTANCE') {
+    try {
+      const main = typeof n.getMainComponentAsync === 'function'
+        ? await n.getMainComponentAsync()
+        : n.mainComponent;
+      if (main) {
+        const meta = { name: main.name || '' };
+        if (main.parent && main.parent.type === 'COMPONENT_SET') {
+          meta.setName = main.parent.name || '';
+          const variant = {};
+          String(main.name || '').split(',').forEach((pair) => {
+            const eq = pair.indexOf('=');
+            if (eq > 0) variant[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+          });
+          if (Object.keys(variant).length) meta.variant = variant;
+        }
+        entry.componentMeta = meta;
+      }
+    } catch (_) {}
+    try {
+      if (n.componentProperties && typeof n.componentProperties === 'object') {
+        const variant = {};
+        for (const key of Object.keys(n.componentProperties)) {
+          const prop = n.componentProperties[key];
+          if (prop && prop.type === 'VARIANT') variant[key.split('#')[0]] = String(prop.value);
+        }
+        if (Object.keys(variant).length) {
+          entry.componentMeta = entry.componentMeta || {};
+          entry.componentMeta.variant = Object.assign({}, entry.componentMeta.variant || {}, variant);
+        }
+      }
+    } catch (_) {}
+  }
   if (n && n.parent && n.parent.type === 'FRAME' && n.constraints && typeof n.constraints === 'object') {
     const h = n.constraints.horizontal;
     const v = n.constraints.vertical;
@@ -697,6 +732,35 @@ function gradientTransformFromAngle(angleDeg) {
   ];
 }
 
+// Map node space → gradient space so the unit gradient circle lands at
+// center (cx,cy) with radii (rx,ry), all as fractions of the node box.
+function gradientTransformForRadial(center, radius) {
+  const cx = center && typeof center.x === 'number' ? center.x : 0.5;
+  const cy = center && typeof center.y === 'number' ? center.y : 0.5;
+  const rx = radius && typeof radius.x === 'number' && radius.x > 0 ? radius.x : 0.5;
+  const ry = radius && typeof radius.y === 'number' && radius.y > 0 ? radius.y : 0.5;
+  return [
+    [1 / (2 * rx), 0, 0.5 - cx / (2 * rx)],
+    [0, 1 / (2 * ry), 0.5 - cy / (2 * ry)]
+  ];
+}
+
+// Rotate the angular sweep to start at the CSS `from` angle around the given
+// center. CSS conic 0deg starts at 12 o'clock; Figma's sweep starts at
+// 3 o'clock, hence the -90° offset.
+function gradientTransformForAngular(center, fromDeg) {
+  const cx = center && typeof center.x === 'number' ? center.x : 0.5;
+  const cy = center && typeof center.y === 'number' ? center.y : 0.5;
+  const rad = ((Number(fromDeg) || 0) - 90) * Math.PI / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  // g = R(-rad) · (p - c) + (0.5, 0.5)
+  return [
+    [cos, sin, 0.5 - cos * cx - sin * cy],
+    [-sin, cos, 0.5 + sin * cx - cos * cy]
+  ];
+}
+
 function gradientPaintFromPatch(g) {
   const stops = Array.isArray(g && g.stops) ? g.stops : [];
   if (stops.length < 2) return null;
@@ -710,10 +774,10 @@ function gradientPaintFromPatch(g) {
     }
   }));
   const type = (g.type === 'GRADIENT_RADIAL' || g.type === 'GRADIENT_ANGULAR') ? g.type : 'GRADIENT_LINEAR';
-  // Linear uses the CSS angle; radial/angular default to a centered transform.
-  const gradientTransform = type === 'GRADIENT_LINEAR'
-    ? gradientTransformFromAngle(g.angle)
-    : [[1, 0, 0], [0, 1, 0]];
+  let gradientTransform;
+  if (type === 'GRADIENT_LINEAR') gradientTransform = gradientTransformFromAngle(g.angle);
+  else if (type === 'GRADIENT_RADIAL') gradientTransform = gradientTransformForRadial(g.center, g.radius);
+  else gradientTransform = gradientTransformForAngular(g.center, g.from);
   return { type, gradientTransform, gradientStops };
 }
 
@@ -899,6 +963,27 @@ async function applyTextStyle(node, style) {
   }
 }
 
+const CSS_BLEND_TO_FIGMA = {
+  'normal': 'NORMAL', 'multiply': 'MULTIPLY', 'screen': 'SCREEN', 'overlay': 'OVERLAY',
+  'darken': 'DARKEN', 'lighten': 'LIGHTEN', 'color-dodge': 'COLOR_DODGE', 'color-burn': 'COLOR_BURN',
+  'hard-light': 'HARD_LIGHT', 'soft-light': 'SOFT_LIGHT', 'difference': 'DIFFERENCE',
+  'exclusion': 'EXCLUSION', 'hue': 'HUE', 'saturation': 'SATURATION', 'color': 'COLOR',
+  'luminosity': 'LUMINOSITY'
+};
+
+// Rewrite the scale mode of existing image fills (patch carries FILL/FIT).
+function applyImageScaleMode(node, style) {
+  const mode = String(style && style.scaleMode || '').toUpperCase();
+  if (!mode || ['FILL', 'FIT', 'CROP', 'TILE'].indexOf(mode) === -1) return;
+  if (!node || !('fills' in node) || !Array.isArray(node.fills)) return;
+  let touched = false;
+  const fills = node.fills.map((p) => {
+    if (p && p.type === 'IMAGE' && p.scaleMode !== mode) { touched = true; return { ...p, scaleMode: mode }; }
+    return p;
+  });
+  if (touched) { try { node.fills = fills; } catch (_) {} }
+}
+
 // Apply visuals shared by TEXT and shape nodes. Async because fonts must load.
 async function applyStyle(node, style) {
   if (!node || !style) return;
@@ -912,24 +997,43 @@ async function applyStyle(node, style) {
       node.fills = paints;
     }
   }
+  applyImageScaleMode(node, style);
   applyStroke(node, style);
   applyCornerRadius(node, style);
   const effects = effectsFromStyle(style);
   if (effects && 'effects' in node) node.effects = effects;
   if (typeof style.opacity === 'number' && 'opacity' in node) node.opacity = Math.max(0, Math.min(1, style.opacity));
   if (typeof style.visible === 'boolean' && 'visible' in node) node.visible = style.visible;
+  if (typeof style.blendMode === 'string' && 'blendMode' in node) {
+    const blend = CSS_BLEND_TO_FIGMA[style.blendMode.toLowerCase()];
+    if (blend) { try { node.blendMode = blend; } catch (_) {} }
+  }
   await applyTextStyle(node, style);
 }
 
 function resizeAndPlaceNode(node, style) {
   if (!node || !style) return;
   if ((typeof style.width === 'number' || typeof style.height === 'number') && typeof node.resize === 'function') {
-    const width = typeof style.width === 'number' ? Math.max(1, style.width) : node.width;
-    const height = typeof style.height === 'number' ? Math.max(1, style.height) : node.height;
-    node.resize(width, height);
+    let width = typeof style.width === 'number' ? Math.max(1, style.width) : node.width;
+    let height = typeof style.height === 'number' ? Math.max(1, style.height) : node.height;
+    // Hug text sizes itself from content — never force the captured box back.
+    if (node.type === 'TEXT' && node.textAutoResize === 'WIDTH_AND_HEIGHT') { width = node.width; height = node.height; }
+    else if (node.type === 'TEXT' && node.textAutoResize === 'HEIGHT') height = node.height;
+    // Never fight hug-content axes on auto-layout frames.
+    if (node.layoutMode === 'HORIZONTAL' || node.layoutMode === 'VERTICAL') {
+      const isRow = node.layoutMode === 'HORIZONTAL';
+      const primaryAuto = node.primaryAxisSizingMode === 'AUTO';
+      const counterAuto = node.counterAxisSizingMode === 'AUTO';
+      if (isRow ? primaryAuto : counterAuto) width = node.width;
+      if (isRow ? counterAuto : primaryAuto) height = node.height;
+    }
+    if (width !== node.width || height !== node.height) node.resize(width, height);
   }
   if (typeof style.x === 'number' && 'x' in node) node.x = style.x;
   if (typeof style.y === 'number' && 'y' in node) node.y = style.y;
+  if (typeof style.rotation === 'number' && 'rotation' in node) {
+    try { node.rotation = style.rotation; } catch (_) {}
+  }
 }
 
 // When a patch creates a fresh page, root-level creates go here instead of the
@@ -979,12 +1083,42 @@ function applyAutoLayout(node, al, childPairs, style) {
       if (cst && cst.layoutGrow && 'layoutGrow' in child) { try { child.layoutGrow = 1; } catch (_) {} }
     }
 
-    // Keep the captured frame size (auto-layout otherwise hugs its contents).
-    if ('primaryAxisSizingMode' in node) node.primaryAxisSizingMode = 'FIXED';
-    if ('counterAxisSizingMode' in node) node.counterAxisSizingMode = 'FIXED';
-    const w = typeof style.width === 'number' ? Math.max(0.01, style.width) : node.width;
-    const h = typeof style.height === 'number' ? Math.max(0.01, style.height) : node.height;
-    if (typeof node.resize === 'function') node.resize(w, h);
+    // Sizing: AUTO (hug) when the helper inferred content-driven sizing,
+    // FIXED otherwise. Only FIXED axes get resized — resizing a hug axis
+    // would fight the layout engine's own recalculation.
+    const primaryAuto = al.primaryAxisSizingMode === 'AUTO';
+    const counterAuto = al.counterAxisSizingMode === 'AUTO';
+    if ('primaryAxisSizingMode' in node) node.primaryAxisSizingMode = primaryAuto ? 'AUTO' : 'FIXED';
+    if ('counterAxisSizingMode' in node) node.counterAxisSizingMode = counterAuto ? 'AUTO' : 'FIXED';
+    const isRow = node.layoutMode === 'HORIZONTAL';
+    const wAuto = isRow ? primaryAuto : counterAuto;
+    const hAuto = isRow ? counterAuto : primaryAuto;
+    const w = !wAuto && typeof style.width === 'number' ? Math.max(0.01, style.width) : node.width;
+    const h = !hAuto && typeof style.height === 'number' ? Math.max(0.01, style.height) : node.height;
+    if ((!wAuto || !hAuto) && typeof node.resize === 'function') node.resize(w, h);
+  } catch (_) {}
+}
+
+// Update-path auto-layout: reflow gap / padding / alignment onto a frame that
+// is ALREADY auto-layout with the same direction. Never restructures
+// (NONE↔flex, direction flips) and never touches sizing modes or size —
+// the diff only emits this when the direction matches the baseline.
+function applyAutoLayoutUpdate(node, al) {
+  if (!node || !al || !('layoutMode' in node)) return;
+  if (node.layoutMode !== 'HORIZONTAL' && node.layoutMode !== 'VERTICAL') return;
+  if (al.mode && node.layoutMode !== al.mode) return;
+  try {
+    if (typeof al.itemSpacing === 'number') node.itemSpacing = al.itemSpacing;
+    if (typeof al.paddingTop === 'number') node.paddingTop = al.paddingTop;
+    if (typeof al.paddingRight === 'number') node.paddingRight = al.paddingRight;
+    if (typeof al.paddingBottom === 'number') node.paddingBottom = al.paddingBottom;
+    if (typeof al.paddingLeft === 'number') node.paddingLeft = al.paddingLeft;
+    if (al.primaryAxisAlignItems) { try { node.primaryAxisAlignItems = al.primaryAxisAlignItems; } catch (_) {} }
+    if (al.counterAxisAlignItems) { try { node.counterAxisAlignItems = al.counterAxisAlignItems; } catch (_) {} }
+    if (al.layoutWrap === 'WRAP' && node.layoutMode === 'HORIZONTAL' && 'layoutWrap' in node) {
+      node.layoutWrap = 'WRAP';
+      if (typeof al.counterAxisSpacing === 'number') { try { node.counterAxisSpacing = al.counterAxisSpacing; } catch (_) {} }
+    }
   } catch (_) {}
 }
 
@@ -1000,8 +1134,12 @@ async function buildNodeFromSpec(spec, collector) {
     node = figma.createText();
     node.fontName = await loadTextFont(style);
     node.characters = String(spec.text || 'Text');
-    // Fixed size so the captured layout width/height stick (no auto-resize).
-    try { node.textAutoResize = 'NONE'; } catch (_) {}
+    // Single-line text hugs (helper marks it) so CJK font-fallback metric
+    // differences never wrap it; multi-line keeps the captured fixed size.
+    const autoResize = style.textAutoResize === 'WIDTH_AND_HEIGHT' || style.textAutoResize === 'HEIGHT'
+      ? style.textAutoResize
+      : 'NONE';
+    try { node.textAutoResize = autoResize; } catch (_) {}
   } else if (kind === 'svg' && spec.svgContent) {
     try {
       node = figma.createNodeFromSvg(String(spec.svgContent));
@@ -1029,7 +1167,10 @@ async function buildNodeFromSpec(spec, collector) {
     try {
       const bytes = figma.base64Decode(String(spec.imageBase64));
       const image = figma.createImage(bytes);
-      node.fills = [{ type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash }];
+      const scaleMode = ['FILL', 'FIT', 'CROP', 'TILE'].indexOf(String(style.scaleMode || '').toUpperCase()) !== -1
+        ? String(style.scaleMode).toUpperCase()
+        : 'FILL';
+      node.fills = [{ type: 'IMAGE', scaleMode, imageHash: image.hash }];
       isImage = true;
     } catch (_) {}
   }
@@ -1136,6 +1277,7 @@ async function applyPatch(patch) {
         const style = op.style || {};
         resizeAndPlaceNode(node, style);
         await applyStyle(node, style);
+        applyAutoLayoutUpdate(node, style.autoLayout);
         results.push({ id: op.id, ok: true, action: 'update' });
       } catch (error) {
         results.push({ id: op.id, ok: false, action: op.action || 'update', message: String(error && error.message || error) });
@@ -1246,16 +1388,23 @@ figma.ui.onmessage = async (msg) => {
   }
   if (msg.type === 'export-figma-render') {
     try {
-      const sel = figma.currentPage.selection || [];
-      if (sel.length !== 1 || typeof sel[0].exportAsync !== 'function') {
-        figma.ui.postMessage({ type: 'export-figma-render:result', base64: '' });
+      let node = null;
+      if (msg.nodeId) {
+        try { node = await figma.getNodeByIdAsync(String(msg.nodeId)); } catch (_) {}
+      }
+      if (!node) {
+        const sel = figma.currentPage.selection || [];
+        node = sel.length === 1 ? sel[0] : null;
+      }
+      if (!node || typeof node.exportAsync !== 'function') {
+        figma.ui.postMessage({ type: 'export-figma-render:result', base64: '', requestId: msg.requestId });
         return;
       }
-      const bytes = await sel[0].exportAsync({ format: 'PNG' });
+      const bytes = await node.exportAsync({ format: 'PNG' });
       const b64 = figma.base64Encode(bytes);
-      figma.ui.postMessage({ type: 'export-figma-render:result', base64: b64 });
+      figma.ui.postMessage({ type: 'export-figma-render:result', base64: b64, requestId: msg.requestId });
     } catch (e) {
-      figma.ui.postMessage({ type: 'export-figma-render:result', base64: '' });
+      figma.ui.postMessage({ type: 'export-figma-render:result', base64: '', requestId: msg.requestId });
     }
   }
   if (msg.type === 'apply-patch') {

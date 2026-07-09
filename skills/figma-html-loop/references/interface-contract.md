@@ -27,6 +27,17 @@ Required endpoints:
 - `GET /api/apply/pending` / `POST /api/apply/ack` — plugin polls & acknowledges. The ack body includes `created` (a `createId → figmaId` map, nested nodes included) and `page`.
 - `POST /api/writeback` — write `data-figma-id` back into a source HTML (matched by `data-figma-create-id`) using the last apply's `created` map, and optionally emit a `loop-manifest` so the next round-trip updates instead of re-creating.
 
+Verify (pixel-diff fidelity check):
+
+- `POST /api/render/request` — start a verify job (`{ nodeId?, out? }`; nodeId defaults to the exported manifest's first root). One active job at a time.
+- `GET /api/render/pending` — polled by the plugin UI; returns `{ job: { id, nodeId } }` when a Figma-side render is wanted.
+- `POST /api/render/figma` — plugin posts `{ id, base64 }` (PNG from `exportAsync`).
+- `GET /api/render/html-pending` — polled by the injected capture client; returns `{ job: { id, selector } }` when an HTML-side render is wanted.
+- `POST /api/render/html` — page posts `{ id, dataUrl }` (PNG from html-to-image).
+- `GET /api/render/status` — `{ figmaDone, htmlDone }` for the active job.
+- `POST /api/verify/compare` — pixel-compares the two PNGs (`{ threshold? }` per-channel 0-255, default 25); writes `verify/diff.png` and returns match/mismatch percentages and paths.
+- `GET /libs/html-to-image.min.js` — serves the DOM screenshot library to the exported page.
+
 ## CLI
 
 CLI commands should output JSON and avoid interactive prompts:
@@ -44,6 +55,8 @@ figma-html-loop build-page --page-name "New Page" --out ./figma-patch.json --jso
 figma-html-loop build-page --page-name "Board" --cols 3 --gap 48 --out ./figma-patch.json --json
 figma-html-loop annotate-ids --html ./screen.html --json
 figma-html-loop apply --patch ./figma-patch.json --json
+figma-html-loop sync --json                    # capture-stable → diff → queue for plugin approval, in one command
+figma-html-loop verify --json                  # render Figma node + exported HTML, pixel-compare, report match % + diff.png
 figma-html-loop writeback --html ./screen.html --manifest-out ./loop-manifest.json --json
 ```
 

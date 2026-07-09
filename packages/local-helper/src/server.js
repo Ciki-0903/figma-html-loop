@@ -7,6 +7,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 const { URL } = require("url");
 const { packageFontsForExport } = require("./font-packager");
+const { comparePng } = require("./pixel-diff");
 
 const port = Number(process.env.FIGMA_HTML_LOOP_PORT || 7800);
 const projectRoot = path.resolve(__dirname, "..", "..", "..");
@@ -15,12 +16,15 @@ const cacheRoot = path.resolve(__dirname, "..", "..", "..", "temp");
 const defaultExportDir = path.join(projectRoot, "figma-html-loop-export");
 const imageCacheDir = path.join(cacheRoot, "images");
 const svgCacheDir = path.join(cacheRoot, "svgs");
-const helperVersion = "roundtrip-1.0";
+const helperVersion = "roundtrip-1.4";
 
 let latestSelection = null;
 let pendingPatch = null;
 let lastApplied = null;
 let latestCapture = null;
+// Active verify render job: the plugin polls for the Figma-side PNG, the
+// exported page polls for the HTML-side PNG; verify compares the two.
+let renderJob = null;
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -206,6 +210,48 @@ function renderNode(node, cssRules, manifestNodes, root) {
   return `<div ${attrs} class="figma-node ${cls}">\n${children}\n</div>`;
 }
 
+// Max right/bottom edge of any visible node, relative to the composition
+// origin. Used to detect scrollable screens whose content extends past the
+// root frame (clipsContent would hide it in the browser preview entirely).
+function compositionContentExtent(composition) {
+  const origin = composition && composition.absOrigin ? composition.absOrigin : { x: 0, y: 0 };
+  const ox = Number(origin.x) || 0;
+  const oy = Number(origin.y) || 0;
+  let maxRight = 0;
+  let maxBottom = 0;
+  (function walk(nodes) {
+    for (const node of nodes || []) {
+      if (!node || node.visible === false) continue;
+      const M = Array.isArray(node.absoluteTransform) ? node.absoluteTransform : null;
+      if (M && M[0] && M[1] && typeof M[0][2] === "number" && typeof M[1][2] === "number") {
+        maxRight = Math.max(maxRight, M[0][2] - ox + (Number(node.width) || 0));
+        maxBottom = Math.max(maxBottom, M[1][2] - oy + (Number(node.height) || 0));
+      }
+      walk(node.children);
+    }
+  })(composition && composition.children);
+  return { maxRight: Math.ceil(maxRight), maxBottom: Math.ceil(maxBottom) };
+}
+
+// When content extends below the root frame, grow the page wrapper and
+// un-clip the root frames so the full screen is visible and scrollable at
+// the page level. Node rects are untouched, so diff geometry stays stable
+// (a scrollable node container would shift child rects and pollute diffs).
+function longScreenCss(session, height, rootSelectors) {
+  const extent = compositionContentExtent(session.composition);
+  if (!(extent.maxBottom > height + 4)) return [];
+  const rules = [
+    `.figma-export{height:${extent.maxBottom}px;}`,
+    // The engine base CSS locks html/body to overflow:hidden; unlock page
+    // scrolling so the grown wrapper is actually reachable.
+    "html,body{overflow:auto !important;}"
+  ];
+  for (const selector of rootSelectors) {
+    rules.push(`.figma-export ${selector}{overflow:visible !important;}`);
+  }
+  return rules;
+}
+
 function buildExport(session) {
   if (!session.composition || !Array.isArray(session.composition.children)) {
     throw new Error("The Figma plugin sent only a selection summary, not the full layer tree. Re-import the plugin manifest, reopen the plugin, click Export Selection again, then retry export.");
@@ -217,7 +263,8 @@ function buildExport(session) {
   const cssRules = [
     "html,body{margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;}",
     `.figma-export{position:relative;width:${Math.ceil(bounds.width || 800)}px;height:${Math.ceil(bounds.height || 600)}px;background:transparent;overflow:visible;}`,
-    ".figma-node{box-sizing:border-box;}"
+    ".figma-node{box-sizing:border-box;}",
+    ...longScreenCss(session, Math.ceil(bounds.height || 600), roots.map((n) => `> [data-figma-id="${n.id}"]`))
   ];
   const manifestNodes = {};
   const body = roots.map((root) => renderNode(root, cssRules, manifestNodes, root)).join("\n");
@@ -254,6 +301,11 @@ async function buildBridgeEngineExport(session) {
   if (!fs.existsSync(entry)) {
     throw new Error("bridge-engine is not built yet.");
   }
+  // A long-lived helper must not serve a stale engine after `npm run build`:
+  // drop cached dist modules so every export loads the current build.
+  for (const key of Object.keys(require.cache)) {
+    if (key.startsWith(bridgeEngineDist)) delete require.cache[key];
+  }
   const engine = require(entry);
   if (!engine || typeof engine.figmaSelectionToHtml !== "function") {
     throw new Error("bridge-engine does not expose figmaSelectionToHtml.");
@@ -273,9 +325,11 @@ async function buildBridgeEngineExport(session) {
   const width = Math.ceil(Number(result.baseWidth || session.composition?.bounds?.width || 800));
   const height = Math.ceil(Number(result.baseHeight || session.composition?.bounds?.height || 600));
   const bodyHtml = `<div class="figma-export" data-loop-session="${escAttr(session.sessionId)}">\n${result.bodyHtml}\n</div>`;
+  const rootIds = Array.isArray(result.manifest && result.manifest.rootIds) ? result.manifest.rootIds : [];
   const shellCss = [
     `.figma-export{position:relative;width:${width}px;height:${height}px;overflow:visible;background:transparent;}`,
-    `.figma-export>.content-layer{position:relative;width:${width}px;height:${height}px;}`
+    `.figma-export>.content-layer{position:relative;width:${width}px;height:${height}px;}`,
+    ...longScreenCss(session, height, rootIds.map((id) => `[data-figma-id="${id}"]`))
   ].join("\n");
   const html = `<!doctype html>
 <html lang="en">
@@ -592,7 +646,12 @@ function captureClientScript() {
       visibility: cs.visibility,
       display: cs.display,
       objectFit: cs.objectFit,
-      // Flex layout → Figma auto-layout
+      backgroundSize: cs.backgroundSize,
+      backgroundPosition: cs.backgroundPosition,
+      mixBlendMode: cs.mixBlendMode,
+      transform: cs.transform,
+      // Flex/grid layout → Figma auto-layout
+      gridTemplateColumns: cs.gridTemplateColumns,
       flexDirection: cs.flexDirection,
       justifyContent: cs.justifyContent,
       alignItems: cs.alignItems,
@@ -707,19 +766,26 @@ function captureClientScript() {
   function capture() {
     const root = document.querySelector(".figma-export") || document.body;
     const rootRect = root.getBoundingClientRect();
+    // Preview pages may scale the whole export (e.g. fit-to-screen fullscreen
+    // mode). Client rects are visual-space; divide by the root's uniform scale
+    // factor so all captured geometry stays in design-space pixels. Computed
+    // styles (font sizes, colors) are unaffected by transforms.
+    const rootScale = root.offsetWidth > 0 ? rootRect.width / root.offsetWidth : 1;
+    const norm = (v) => v / (rootScale || 1);
     const nodes = {};
     const created = [];
     const selector = "[data-figma-id], [data-figma-create], [data-figma-new]";
     document.querySelectorAll(selector).forEach((el, index) => {
-      if (!(el instanceof HTMLElement)) return;
+      // Inline <svg data-figma-create="svg"> roots are SVGElement, not HTMLElement.
+      if (!(el instanceof HTMLElement || el instanceof SVGElement)) return;
       const cs = getComputedStyle(el);
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 && rect.height <= 0) return;
       const bounds = {
-        x: round(rect.left - rootRect.left + root.scrollLeft),
-        y: round(rect.top - rootRect.top + root.scrollTop),
-        width: round(rect.width),
-        height: round(rect.height)
+        x: round(norm(rect.left - rootRect.left) + root.scrollLeft),
+        y: round(norm(rect.top - rootRect.top) + root.scrollTop),
+        width: round(norm(rect.width)),
+        height: round(norm(rect.height))
       };
       const style = pickStyle(cs);
       const imageSrc = imageFrom(el, cs);
@@ -758,7 +824,7 @@ function captureClientScript() {
         if (pAnc) {
           parentFigmaId = pAnc.getAttribute("data-figma-id") || "";
           const pr = pAnc.getBoundingClientRect();
-          local = { x: round(rect.left - pr.left), y: round(rect.top - pr.top) };
+          local = { x: round(norm(rect.left - pr.left)), y: round(norm(rect.top - pr.top)) };
         }
         nodes[figmaId] = {
           id: figmaId,
@@ -822,6 +888,43 @@ function captureClientScript() {
             }
           });
         });
+
+        // Auto-split: direct text nodes inside a created frame become their
+        // own virtual text layers (measured via Range), so a "text + inline
+        // box" mix keeps its loose text when the container becomes a frame,
+        // without requiring hand-wrapped spans in the source HTML.
+        let vi = 0;
+        el.childNodes.forEach(function (tn) {
+          if (tn.nodeType !== 3) return;
+          const content = String(tn.textContent || "").trim();
+          if (!content) return;
+          const fontPx = parseFloat(cs.fontSize) || 0;
+          const colorMatch = String(cs.color || "").match(/rgba?\(([^)]+)\)/);
+          const colorParts = colorMatch ? colorMatch[1].split(",") : [];
+          const alpha = colorParts.length >= 4 ? parseFloat(colorParts[3]) : 1;
+          if (fontPx < 1 || alpha === 0) return; // hidden icon-font style text
+          const range = document.createRange();
+          range.selectNodeContents(tn);
+          const r = range.getBoundingClientRect();
+          if (!(r.width > 0.5 && r.height > 0.5)) return;
+          created.push({
+            createId: createId + "_t" + (vi++),
+            parentCreateId: createId,
+            parentId: "",
+            name: content.slice(0, 12),
+            kind: "text",
+            text: content,
+            segments: null,
+            bounds: {
+              x: round(norm(r.left - rootRect.left) + root.scrollLeft),
+              y: round(norm(r.top - rootRect.top) + root.scrollTop),
+              width: round(norm(r.width)),
+              height: round(norm(r.height))
+            },
+            style: pickStyle(cs),
+            imageSrc: ""
+          });
+        });
       }
     });
     return {
@@ -871,6 +974,46 @@ function captureClientScript() {
     attributes: true,
     characterData: true
   });
+
+  // ---- verify support: render this page to PNG on helper request ----
+  var htmlToImageReady = null;
+  function loadHtmlToImage() {
+    if (window.htmlToImage) return Promise.resolve();
+    if (htmlToImageReady) return htmlToImageReady;
+    htmlToImageReady = new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.src = helper + "/libs/html-to-image.min.js";
+      s.onload = function () { resolve(); };
+      s.onerror = function () { htmlToImageReady = null; reject(new Error("html-to-image failed to load")); };
+      document.head.appendChild(s);
+    });
+    return htmlToImageReady;
+  }
+  var renderBusy = false;
+  function pollRenderRequest() {
+    if (renderBusy || document.hidden) return;
+    fetch(helper + "/api/render/html-pending", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var job = data && data.job;
+        if (!job) return;
+        renderBusy = true;
+        return loadHtmlToImage().then(function () {
+          var el = (job.selector && document.querySelector(job.selector))
+            || document.querySelector(".figma-export")
+            || document.body;
+          return window.htmlToImage.toPng(el, { pixelRatio: 1 });
+        }).then(function (dataUrl) {
+          return fetch(helper + "/api/render/html", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: job.id, dataUrl: dataUrl })
+          });
+        }).then(function () { renderBusy = false; }, function () { renderBusy = false; });
+      })
+      .catch(function () { renderBusy = false; });
+  }
+  setInterval(pollRenderRequest, 2000);
 })();
 `;
 }
@@ -962,9 +1105,70 @@ function cacheImageFromCapture(src) {
   return id;
 }
 
+// Decode an SVG referenced from CSS background-image: data URI (base64 or
+// URL-encoded) or a local .svg file. Returns "" for anything else.
+function svgTextFromImageSrc(src) {
+  const raw = String(src || "").trim();
+  if (!raw) return "";
+  let m = raw.match(/^data:image\/svg\+xml;base64,(.*)$/i);
+  if (m) {
+    try { return Buffer.from(m[1], "base64").toString("utf8"); } catch (_) { return ""; }
+  }
+  m = raw.match(/^data:image\/svg\+xml[^,]*,(.*)$/i);
+  if (m) {
+    try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
+  }
+  const localPath = cssUrlToLocalPath(raw);
+  if (localPath && /\.svg$/i.test(localPath) && fs.existsSync(localPath)) {
+    try { return fs.readFileSync(localPath, "utf8"); } catch (_) { return ""; }
+  }
+  return "";
+}
+
+// A CSS background SVG cannot become a Figma image fill (fills are raster
+// only); recreate it as a vector child layer placed per background-size /
+// background-position, keeping the container's own fill and radius.
+function svgIconChildFromCapture(item, svgText) {
+  const bounds = item && item.bounds ? item.bounds : {};
+  const css = item && item.style ? item.style : {};
+  const pw = Number(bounds.width) || 0;
+  const ph = Number(bounds.height) || 0;
+  let iw = pw, ih = ph;
+  const sizeTokens = String(css.backgroundSize || "").match(/(-?\d+(?:\.\d+)?)px/g);
+  if (sizeTokens && sizeTokens.length) {
+    iw = parseFloat(sizeTokens[0]);
+    ih = sizeTokens[1] != null ? parseFloat(sizeTokens[1]) : iw;
+  }
+  const place = (token, total, size) => {
+    const t = String(token || "").trim();
+    if (/%$/.test(t)) return ((total - size) * parseFloat(t)) / 100;
+    if (/px$/i.test(t)) return parseFloat(t);
+    return (total - size) / 2;
+  };
+  const pos = String(css.backgroundPosition || "").trim().split(/\s+/);
+  return {
+    action: "create",
+    id: `${String(item.createId || item.id || "node")}_svgbg`,
+    kind: "svg",
+    name: `${item.name || "icon"} 图标`,
+    text: "",
+    svgContent: svgText,
+    style: {
+      x: Math.round(place(pos[0], pw, iw) * 100) / 100,
+      y: Math.round(place(pos.length > 1 ? pos[1] : pos[0], ph, ih) * 100) / 100,
+      width: Math.max(1, iw),
+      height: Math.max(1, ih),
+      absolutePos: true
+    }
+  };
+}
+
 function imageBase64FromCapture(src) {
   const raw = String(src || "").trim();
   if (!raw) return "";
+  // Vectors are not raster fills — the svg path handles them (a base64 svg
+  // slipped through here before and was cached as a broken "png").
+  if (/^data:image\/svg\+xml/i.test(raw)) return "";
   if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(raw)) return raw.replace(/^data:image\/[a-z0-9.+-]+;base64,/i, "");
   const localPath = cssUrlToLocalPath(raw);
   if (!localPath || !fs.existsSync(localPath)) return "";
@@ -1054,67 +1258,206 @@ function parseBoxShadow(value) {
   return effects.length ? effects : null;
 }
 
-// Convert a CSS linear-gradient direction keyword or angle into a CSS-degrees value.
-function gradientAngleFromDirection(token) {
+// Convert a CSS linear-gradient direction keyword or angle into CSS degrees.
+// Corner keywords ("to top right") depend on the box aspect ratio: the CSS
+// gradient line points at the corner, which is only 45° in a square box.
+// Without a box the legacy fixed diagonals are used.
+function gradientAngleFromDirection(token, box) {
   const t = String(token || "").trim().toLowerCase();
   const deg = t.match(/^(-?\d+(?:\.\d+)?)deg$/);
   if (deg) return Number(deg[1]);
+  const turn = t.match(/^(-?\d+(?:\.\d+)?)turn$/);
+  if (turn) return Number(turn[1]) * 360;
   if (t.startsWith("to ")) {
-    const dir = t.slice(3).trim();
-    const map = {
-      "top": 0, "right": 90, "bottom": 180, "left": 270,
-      "top right": 45, "right top": 45,
-      "bottom right": 135, "right bottom": 135,
-      "bottom left": 225, "left bottom": 225,
-      "top left": 315, "left top": 315
+    const dir = t.slice(3).trim().split(/\s+/).sort().join(" ");
+    const side = { "top": 0, "right": 90, "bottom": 180, "left": 270 };
+    if (side[dir] != null) return side[dir];
+    const w = box && Number(box.width) > 0 ? Number(box.width) : 0;
+    const h = box && Number(box.height) > 0 ? Number(box.height) : 0;
+    const a = w && h ? Math.round((Math.atan2(w, h) * 180 / Math.PI) * 100) / 100 : 45;
+    const corner = {
+      "right top": a,
+      "bottom right": 180 - a,
+      "bottom left": 180 + a,
+      "left top": 360 - a
     };
-    if (map[dir] != null) return map[dir];
+    if (corner[dir] != null) return corner[dir];
   }
   return null;
 }
 
 // Extract color stops from gradient argument parts (skips non-color args like
 // shape/size/position/angle that may precede the stops in radial/conic).
-function parseGradientStops(args) {
-  const stops = [];
-  const colorParts = args.filter((sp) => extractColorToken(sp).color);
-  colorParts.forEach((sp, idx) => {
-    const { color, rest } = extractColorToken(sp);
+// Positions: % always; deg/turn for conic (opts.angular); px against
+// opts.axisPx when known. Unpositioned stops interpolate linearly between
+// their nearest positioned neighbors (CSS behavior), first→0 and last→1.
+function parseGradientStops(args, opts = {}) {
+  const axisPx = Number(opts.axisPx) || 0;
+  const angular = !!opts.angular;
+  const entries = [];
+  for (const part of args) {
+    const { color, rest } = extractColorToken(part);
+    if (!color) continue;
     const fill = cssColorToFigma(color);
-    if (!fill) return;
+    if (!fill) continue;
+    let position = null;
     const pct = rest.match(/(-?\d+(?:\.\d+)?)%/);
-    let position = pct ? Number(pct[1]) / 100 : (colorParts.length > 1 ? idx / (colorParts.length - 1) : 0);
-    position = Math.max(0, Math.min(1, position));
-    stops.push({ position, r: fill.r, g: fill.g, b: fill.b, a: fill.a == null ? 1 : fill.a });
-  });
-  return stops;
+    const degM = angular ? rest.match(/(-?\d+(?:\.\d+)?)deg/) : null;
+    const turnM = angular ? rest.match(/(-?\d+(?:\.\d+)?)turn/) : null;
+    const pxM = !angular && axisPx > 0 ? rest.match(/(-?\d+(?:\.\d+)?)px/) : null;
+    if (pct) position = Number(pct[1]) / 100;
+    else if (degM) position = Number(degM[1]) / 360;
+    else if (turnM) position = Number(turnM[1]);
+    else if (pxM) position = Number(pxM[1]) / axisPx;
+    entries.push({ fill, position });
+  }
+  if (!entries.length) return [];
+  if (entries[0].position == null) entries[0].position = 0;
+  if (entries[entries.length - 1].position == null) entries[entries.length - 1].position = 1;
+  let anchor = 0;
+  for (let i = 1; i < entries.length; i++) {
+    if (entries[i].position == null) continue;
+    if (entries[i].position < entries[anchor].position) entries[i].position = entries[anchor].position;
+    const gap = i - anchor;
+    for (let j = 1; j < gap; j++) {
+      entries[anchor + j].position = entries[anchor].position + ((entries[i].position - entries[anchor].position) * j) / gap;
+    }
+    anchor = i;
+  }
+  return entries.map((e) => ({
+    position: Math.max(0, Math.min(1, e.position)),
+    r: e.fill.r, g: e.fill.g, b: e.fill.b,
+    a: e.fill.a == null ? 1 : e.fill.a
+  }));
 }
 
-// Parse any CSS gradient into a Figma gradient descriptor.
-// { type:'GRADIENT_LINEAR'|'GRADIENT_RADIAL'|'GRADIENT_ANGULAR', angle?, stops }
-function parseGradient(value) {
-  const raw = String(value || "").trim();
-  let m = raw.match(/linear-gradient\(([\s\S]*)\)/i);
-  if (m) {
-    const args = splitTopLevel(m[1]);
-    if (!args.length) return null;
-    let angle = 180, start = 0;
-    const maybeAngle = gradientAngleFromDirection(args[0]);
-    if (maybeAngle != null && !/rgba?\(|#[0-9a-f]/i.test(args[0])) { angle = maybeAngle; start = 1; }
-    const stops = parseGradientStops(args.slice(start));
-    return stops.length >= 2 ? { type: "GRADIENT_LINEAR", angle, stops } : null;
+// "60%" / "left" / "center" → fraction of the box axis.
+function positionFraction(token, fallback = 0.5) {
+  const t = String(token || "").trim().toLowerCase();
+  if (t === "left" || t === "top") return 0;
+  if (t === "center") return 0.5;
+  if (t === "right" || t === "bottom") return 1;
+  const pct = t.match(/^(-?\d+(?:\.\d+)?)%$/);
+  if (pct) return Number(pct[1]) / 100;
+  return fallback;
+}
+
+// Default CSS radial size (farthest-corner) as x/y radius fractions.
+function farthestCornerRadius(shape, center, box) {
+  const w = box && Number(box.width) > 0 ? Number(box.width) : 0;
+  const h = box && Number(box.height) > 0 ? Number(box.height) : 0;
+  if (!w || !h) return null;
+  const cx = center.x * w;
+  const cy = center.y * h;
+  const dx = Math.max(cx, w - cx);
+  const dy = Math.max(cy, h - cy);
+  if (shape === "circle") {
+    const r = Math.sqrt(dx * dx + dy * dy);
+    return { x: r / w, y: r / h };
   }
-  m = raw.match(/radial-gradient\(([\s\S]*)\)/i);
-  if (m) {
-    const stops = parseGradientStops(splitTopLevel(m[1]));
-    return stops.length >= 2 ? { type: "GRADIENT_RADIAL", stops } : null;
+  // ellipse farthest-corner: side radii scaled to pass through the corner
+  return { x: (dx * Math.SQRT2) / w, y: (dy * Math.SQRT2) / h };
+}
+
+// Parse ALL gradient layers of a CSS background-image value (top-level comma
+// split, so multiple backgrounds parse independently). url() layers are
+// skipped — images travel through the imageSrc path. CSS lists layers
+// top-first; callers that build Figma fills must reverse (bottom-first).
+function parseGradientLayers(value, box) {
+  const out = [];
+  for (const layer of splitTopLevel(String(value || "").trim())) {
+    const m = layer.match(/^(repeating-)?(linear|radial|conic)-gradient\(/i);
+    if (!m) continue;
+    const kind = m[2].toLowerCase();
+    // balanced-paren extraction so nested rgba(...) never truncates the body
+    let i = m[0].length, depth = 1;
+    while (i < layer.length && depth > 0) {
+      if (layer[i] === "(") depth++;
+      else if (layer[i] === ")") depth--;
+      i++;
+    }
+    const args = splitTopLevel(layer.slice(m[0].length, i - 1));
+    if (!args.length) continue;
+
+    if (kind === "linear") {
+      let angle = 180, start = 0;
+      const first = args[0];
+      const maybeAngle = gradientAngleFromDirection(first, box);
+      if (maybeAngle != null && !extractColorToken(first).color) { angle = maybeAngle; start = 1; }
+      // px stop positions project onto the CSS gradient line length
+      const rad = (angle * Math.PI) / 180;
+      const w = box && Number(box.width) > 0 ? Number(box.width) : 0;
+      const h = box && Number(box.height) > 0 ? Number(box.height) : 0;
+      const axisPx = w && h ? Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad)) : 0;
+      const stops = parseGradientStops(args.slice(start), { axisPx });
+      if (stops.length >= 2) out.push({ type: "GRADIENT_LINEAR", angle, stops });
+      continue;
+    }
+
+    if (kind === "radial") {
+      let start = 0;
+      let shape = "ellipse";
+      const center = { x: 0.5, y: 0.5 };
+      let radius = null;
+      const prelude = args[0] && !extractColorToken(args[0]).color ? args[0] : null;
+      if (prelude) {
+        start = 1;
+        const atIdx = prelude.search(/\bat\b/i);
+        const sizePart = (atIdx >= 0 ? prelude.slice(0, atIdx) : prelude).trim();
+        const posPart = atIdx >= 0 ? prelude.slice(atIdx + 2).trim() : "";
+        if (/\bcircle\b/i.test(sizePart)) shape = "circle";
+        const lengths = sizePart.match(/(-?\d+(?:\.\d+)?)%/g);
+        if (lengths && lengths.length >= 2) {
+          radius = { x: Number(lengths[0].replace("%", "")) / 100, y: Number(lengths[1].replace("%", "")) / 100 };
+        } else if (lengths && lengths.length === 1 && shape === "circle") {
+          const r = Number(lengths[0].replace("%", "")) / 100;
+          radius = { x: r, y: r };
+        }
+        if (posPart) {
+          const tokens = posPart.split(/\s+/);
+          center.x = positionFraction(tokens[0], 0.5);
+          center.y = positionFraction(tokens[1] != null ? tokens[1] : "center", 0.5);
+        }
+      }
+      if (!radius) radius = farthestCornerRadius(shape, center, box);
+      const w = box && Number(box.width) > 0 ? Number(box.width) : 0;
+      const axisPx = radius && w ? radius.x * w : 0;
+      const stops = parseGradientStops(args.slice(start), { axisPx });
+      if (stops.length >= 2) {
+        const g = { type: "GRADIENT_RADIAL", stops, center, shape };
+        if (radius) g.radius = radius;
+        out.push(g);
+      }
+      continue;
+    }
+
+    // conic
+    let start = 0;
+    let from = 0;
+    const center = { x: 0.5, y: 0.5 };
+    const prelude = args[0] && !extractColorToken(args[0]).color ? args[0] : null;
+    if (prelude && /\bfrom\b|\bat\b/i.test(prelude)) {
+      start = 1;
+      const fromM = prelude.match(/from\s+(-?\d+(?:\.\d+)?)(deg|turn)/i);
+      if (fromM) from = fromM[2].toLowerCase() === "turn" ? Number(fromM[1]) * 360 : Number(fromM[1]);
+      const atM = prelude.match(/\bat\s+(.+)$/i);
+      if (atM) {
+        const tokens = atM[1].trim().split(/\s+/);
+        center.x = positionFraction(tokens[0], 0.5);
+        center.y = positionFraction(tokens[1] != null ? tokens[1] : "center", 0.5);
+      }
+    }
+    const stops = parseGradientStops(args.slice(start), { angular: true });
+    if (stops.length >= 2) out.push({ type: "GRADIENT_ANGULAR", stops, center, from });
   }
-  m = raw.match(/conic-gradient\(([\s\S]*)\)/i);
-  if (m) {
-    const stops = parseGradientStops(splitTopLevel(m[1]));
-    return stops.length >= 2 ? { type: "GRADIENT_ANGULAR", stops } : null;
-  }
-  return null;
+  return out;
+}
+
+// Parse the first gradient of a CSS background-image value.
+// { type:'GRADIENT_LINEAR'|'GRADIENT_RADIAL'|'GRADIENT_ANGULAR', angle?, stops, center?, radius?, from? }
+function parseGradient(value, box) {
+  const layers = parseGradientLayers(value, box);
+  return layers.length ? layers[0] : null;
 }
 
 // Back-compat: linear-only helper used by older call sites.
@@ -1182,12 +1525,99 @@ function mapAlign(v) {
   })[String(v || "").trim()] || "MIN";
 }
 
+// Infer hug (AUTO) sizing for a created auto-layout frame by comparing the
+// container's captured size with its flow children's extent. Wrapping
+// containers are skipped upstream (their main-axis math depends on line
+// breaking). A space-between container never hugs its main axis because the
+// children's sum is smaller than the container — the check naturally fails.
+function inferAutoLayoutSizing(al, style, childSpecs) {
+  const flow = childSpecs.filter((c) => c && c.style && !c.style.absolutePos);
+  if (!flow.length) return;
+  const isRow = al.mode === "HORIZONTAL";
+  const mainSize = (s) => Number(isRow ? s.style.width : s.style.height) || 0;
+  const crossSize = (s) => Number(isRow ? s.style.height : s.style.width) || 0;
+  const mainPadding = isRow
+    ? (al.paddingLeft || 0) + (al.paddingRight || 0)
+    : (al.paddingTop || 0) + (al.paddingBottom || 0);
+  const crossPadding = isRow
+    ? (al.paddingTop || 0) + (al.paddingBottom || 0)
+    : (al.paddingLeft || 0) + (al.paddingRight || 0);
+  const mainSum = flow.reduce((acc, s) => acc + mainSize(s), 0)
+    + Math.max(0, flow.length - 1) * (Number(al.itemSpacing) || 0)
+    + mainPadding;
+  const crossMax = Math.max(...flow.map(crossSize)) + crossPadding;
+  const containerMain = Number(isRow ? style.width : style.height) || 0;
+  const containerCross = Number(isRow ? style.height : style.width) || 0;
+  if (Math.abs(mainSum - containerMain) <= 2) al.primaryAxisSizingMode = "AUTO";
+  if (Math.abs(crossMax - containerCross) <= 2) al.counterAxisSizingMode = "AUTO";
+}
+
+// `margin: auto` centering is invisible in computed styles; detect it from
+// geometry instead: when every flow child sits centered on the cross axis,
+// upgrade the container's counter alignment. Full-width children are
+// trivially centered, so mixed sheets (grab bar + full-width sections) work.
+function inferCounterAxisCenter(al, style, childSpecs) {
+  if (String(al.counterAxisAlignItems || "MIN") !== "MIN" || al.counterStretch) return;
+  const flow = childSpecs.filter((c) => c && c.style && !c.style.absolutePos);
+  if (!flow.length) return;
+  const isRow = al.mode === "HORIZONTAL";
+  const parentSize = Number(isRow ? style.height : style.width) || 0;
+  if (!parentSize) return;
+  const centered = flow.every((c) => {
+    const off = Number(isRow ? c.style.y : c.style.x) || 0;
+    const size = Number(isRow ? c.style.height : c.style.width) || 0;
+    return Math.abs(off + size / 2 - parentSize / 2) <= 2;
+  });
+  if (centered) al.counterAxisAlignItems = "CENTER";
+}
+
+// A CSS `margin-left: auto` tail (chevron/icon pushed to the row end) has no
+// Figma equivalent; emulate it by growing the preceding child to fill the gap.
+function inferTailGrow(al, style, childSpecs) {
+  if (al.mode !== "HORIZONTAL" || al.layoutWrap === "WRAP") return;
+  const flow = childSpecs.filter((c) => c && c.style && !c.style.absolutePos);
+  if (flow.length < 2) return;
+  const last = flow[flow.length - 1];
+  const prev = flow[flow.length - 2];
+  const containerW = Number(style.width) || 0;
+  if (!containerW) return;
+  const lastRight = (Number(last.style.x) || 0) + (Number(last.style.width) || 0);
+  const flushRight = Math.abs(containerW - (Number(al.paddingRight) || 0) - lastRight) <= 2;
+  const gap = (Number(last.style.x) || 0) - ((Number(prev.style.x) || 0) + (Number(prev.style.width) || 0));
+  if (flushRight && gap > (Number(al.itemSpacing) || 0) + 4) prev.style.layoutGrow = 1;
+}
+
+// A simple CSS grid (2+ resolved column tracks) maps to a wrapping
+// horizontal auto-layout: column-gap → itemSpacing, row-gap → cross spacing.
+// Children keep their captured sizes, so the visual grid survives even
+// though Figma has no real grid primitive.
+function gridToAutoLayout(css) {
+  const tracks = String(css.gridTemplateColumns || "").trim().split(/\s+/)
+    .map((t) => px(t))
+    .filter((v) => Number.isFinite(v));
+  if (tracks.length < 2) return null;
+  return {
+    mode: "HORIZONTAL",
+    itemSpacing: px(css.columnGap) || px(css.gap) || 0,
+    paddingTop: px(css.paddingTop) || 0,
+    paddingRight: px(css.paddingRight) || 0,
+    paddingBottom: px(css.paddingBottom) || 0,
+    paddingLeft: px(css.paddingLeft) || 0,
+    primaryAxisAlignItems: "MIN",
+    counterAxisAlignItems: "MIN",
+    layoutWrap: "WRAP",
+    counterAxisSpacing: px(css.rowGap) || px(css.gap) || 0,
+  };
+}
+
 // Translate CSS flexbox into a Figma auto-layout descriptor, or null if not flex.
 function cssToAutoLayout(css) {
   const disp = String((css && css.display) || "").trim();
+  if (disp === "grid" || disp === "inline-grid") return gridToAutoLayout(css);
   if (disp !== "flex" && disp !== "inline-flex") return null;
   const dir = String(css.flexDirection || "row").trim();
   const isColumn = dir.indexOf("column") === 0;
+  const reversed = dir.indexOf("-reverse") !== -1;
   const wrapRaw = String(css.flexWrap || "").trim();
   const wrap = wrapRaw.indexOf("wrap") === 0; // "wrap" or "wrap-reverse", not "nowrap"
 
@@ -1211,12 +1641,17 @@ function cssToAutoLayout(css) {
     if (Number.isFinite(crossGap)) al.counterAxisSpacing = crossGap;
   }
   if (String(css.alignItems || "").trim() === "stretch") al.counterStretch = true;
+  // row-reverse / column-reverse: children order flips and main-axis packing
+  // mirrors; the create path consumes this flag (see specFor).
+  if (reversed) al.reverse = true;
   return al;
 }
 
 // The single source of truth for turning captured CSS into a Figma style patch.
 // Shared by both update (stylePatchFromCapture) and create (createOperationFromCapture).
-function cssToFigmaStyle(css, isText) {
+// `box` ({width,height} px) refines gradient geometry (corner angles, px stops,
+// radial farthest-corner sizing) when available.
+function cssToFigmaStyle(css, isText, box) {
   const style = {};
   css = css || {};
   const get = (camel, kebab) => (css[camel] != null ? css[camel] : css[kebab]);
@@ -1227,11 +1662,19 @@ function cssToFigmaStyle(css, isText) {
     if (fill && fill.a !== 0) style.fill = fill;
   } else {
     const bgImage = get("backgroundImage", "background-image");
-    const gradient = bgImage ? parseGradient(bgImage) : null;
-    if (gradient) {
-      const f = { type: gradient.type, stops: gradient.stops };
-      if (gradient.angle != null) f.angle = gradient.angle;
-      style.fills = [f];
+    const gradients = bgImage ? parseGradientLayers(bgImage, box) : [];
+    if (gradients.length) {
+      const fills = gradients.map((g) => {
+        const f = { type: g.type, stops: g.stops };
+        if (g.angle != null) f.angle = g.angle;
+        if (g.center) f.center = g.center;
+        if (g.radius) f.radius = g.radius;
+        if (g.from != null) f.from = g.from;
+        return f;
+      });
+      // CSS lists background layers top-first; Figma paints bottom-first.
+      fills.reverse();
+      style.fills = fills;
     } else {
       const bg = get("backgroundColor", "background-color") || css.background || css.color;
       const fill = cssColorToFigma(bg);
@@ -1266,15 +1709,46 @@ function cssToFigmaStyle(css, isText) {
 
   // Effects: box-shadow + filter drop-shadow + backdrop blur.
   let effects = parseBoxShadow(get("boxShadow", "box-shadow")) || [];
+  // The export renders INSIDE strokes as zero-blur zero-offset inset
+  // box-shadows; those are strokes, not INNER_SHADOW effects. (A real inner
+  // shadow with no blur and no offset is indistinguishable — accepted edge.)
+  effects = effects.filter((e) => !(e.type === "INNER_SHADOW" && !e.blur && !e.x && !e.y));
   const filterFx = parseFilterEffects(get("filter", "filter"));
   if (filterFx) effects = effects.concat(filterFx);
   const backdropFx = parseBackdropBlur(get("backdropFilter", "backdrop-filter"));
-  if (backdropFx) effects = effects.concat([backdropFx]);
+  // The export renders Figma background blur at radius/2 in CSS, so the CSS
+  // value must double on the way back or blur shrinks every round trip.
+  if (backdropFx) effects = effects.concat([{ ...backdropFx, blur: backdropFx.blur * 2 }]);
   if (effects.length) style.effects = effects;
 
   // Visibility.
   const visibility = get("visibility", "visibility");
   if (visibility === "hidden") style.visible = false;
+
+  // Blend mode (kebab-case CSS value; 'normal' is the implicit default).
+  const blend = String(get("mixBlendMode", "mix-blend-mode") || "").trim().toLowerCase();
+  if (blend && blend !== "normal") style.blendMode = blend;
+
+  // Image scale mode from object-fit / background-size. Only the two
+  // unambiguous keywords translate; percentage/px sizes belong to CROP
+  // transforms which the capture cannot reconstruct.
+  if (!isText) {
+    const objectFit = String(get("objectFit", "object-fit") || "").trim().toLowerCase();
+    const bgSize = String(get("backgroundSize", "background-size") || "").trim().toLowerCase();
+    const fit = (objectFit === "cover" || objectFit === "contain")
+      ? objectFit
+      : ((bgSize === "cover" || bgSize === "contain") ? bgSize : "");
+    if (fit) style.scaleMode = fit === "cover" ? "FILL" : "FIT";
+  }
+
+  // Rotation from the computed transform matrix. CSS rotates clockwise
+  // (screen coords), Figma's rotation property is counter-clockwise.
+  const transform = String(get("transform", "transform") || "");
+  const matrix = transform.match(/matrix\(\s*(-?[\d.e+-]+)\s*,\s*(-?[\d.e+-]+)\s*,/i);
+  if (matrix) {
+    const deg = Math.atan2(Number(matrix[2]) || 0, Number(matrix[1])) * 180 / Math.PI;
+    if (Math.abs(deg) > 0.05) style.rotation = -Math.round(deg * 100) / 100;
+  }
 
   // Per-child layout hints apply to any node inside an auto-layout parent.
   if (String(get("position", "position") || "") === "absolute") style.absolutePos = true;
@@ -1326,6 +1800,22 @@ function normManifestStyle(ms) {
         });
       }
     }
+    // All gradient layers (fills order = bottom-first) for multi-layer compare.
+    const gradientFills = ms.fills.filter((x) => x && x.visible !== false && String(x.type || "").indexOf("GRADIENT") === 0);
+    if (gradientFills.length) {
+      out.gradients = gradientFills.map((g) => (Array.isArray(g.gradientStops) ? g.gradientStops.map((s) => {
+        const c = s.color || {};
+        return [Number(s.position) || 0, c.r, c.g, c.b, c.a == null ? 1 : c.a];
+      }) : []));
+    }
+    // Image fill scale mode baseline (exported image shapes carry it).
+    const imageFill = ms.fills.find((x) => x && x.visible !== false && String(x.type || "").toUpperCase() === "IMAGE");
+    if (imageFill) out.scaleMode = String(imageFill.scaleMode || "FILL").toUpperCase();
+  }
+  // Blend mode baseline: the export only records non-normal modes, so a
+  // missing value IS the 'normal' baseline.
+  if (ms && typeof ms === "object") {
+    out.blendMode = typeof ms.blendMode === "string" ? String(ms.blendMode).toLowerCase() : "normal";
   }
   if (ms && ms.radii) {
     if (typeof ms.radii.uniform === "number") out.cornerRadius = ms.radii.uniform;
@@ -1342,6 +1832,48 @@ function normManifestStyle(ms) {
     if (s.type === "SOLID" && s.color) out.strokeColor = { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a == null ? 1 : s.color.a };
   }
   if (ms && typeof ms.opacity === "number") out.opacity = ms.opacity;
+
+  // Effects baseline, normalized to the capture's patch shape ({x,y,blur,spread}
+  // in Figma units) so shadow edits can be diffed property-for-property.
+  if (ms && Array.isArray(ms.effects)) {
+    out.effects = [];
+    for (const e of ms.effects) {
+      if (!e || e.visible === false || !e.type) continue;
+      const type = String(e.type).toUpperCase();
+      if (type === "DROP_SHADOW" || type === "INNER_SHADOW") {
+        out.effects.push({
+          type,
+          x: Number(e.offset && e.offset.x) || 0,
+          y: Number(e.offset && e.offset.y) || 0,
+          blur: Number(e.radius) || 0,
+          spread: Number(e.spread) || 0,
+          color: e.color ? { r: e.color.r, g: e.color.g, b: e.color.b, a: e.color.a == null ? 1 : e.color.a } : { r: 0, g: 0, b: 0, a: 1 }
+        });
+      } else if (type === "LAYER_BLUR" || type === "BACKGROUND_BLUR") {
+        out.effects.push({ type, blur: Number(e.radius) || 0 });
+      }
+    }
+  }
+
+  // Text baseline (uniform-run snapshot from the export), normalized to the
+  // capture's CSS-derived shape so font edits can be compared directly.
+  const ts = ms && ms.textStyle;
+  if (ts && typeof ts === "object") {
+    if (typeof ts.fontSize === "number") out.fontSize = ts.fontSize;
+    if (typeof ts.fontWeight === "number") out.fontWeight = ts.fontWeight;
+    if (typeof ts.fontFamily === "string") out.fontFamily = ts.fontFamily;
+    if (typeof ts.italic === "boolean") out.fontStyle = ts.italic ? "italic" : "normal";
+    if (typeof ts.letterSpacingPx === "number") out.letterSpacing = ts.letterSpacingPx;
+    if (typeof ts.lineHeightPx === "number") out.lineHeightPx = ts.lineHeightPx;
+    if (typeof ts.textAlign === "string") {
+      const alignMap = { LEFT: "left", CENTER: "center", RIGHT: "right", JUSTIFIED: "justify" };
+      out.textAlign = alignMap[String(ts.textAlign).toUpperCase()] || String(ts.textAlign).toLowerCase();
+    }
+    if (typeof ts.textDecoration === "string") {
+      const decoMap = { NONE: "none", UNDERLINE: "underline", STRIKETHROUGH: "line-through" };
+      out.textDecoration = decoMap[String(ts.textDecoration).toUpperCase()] || "none";
+    }
+  }
   return out;
 }
 
@@ -1364,24 +1896,42 @@ function colorEq(a, b) {
     && Math.abs((a.a == null ? 1 : a.a) - (b.a == null ? 1 : b.a)) < 0.02;
 }
 
+// Effect equality in patch shape (captured a vs baseline b, Figma units).
+// A captured spread of 0 is ambiguous — filter:drop-shadow() carries no
+// spread — so only a non-zero captured spread can contradict the baseline.
+function effectSigEq(a, b) {
+  if (!a || !b || a.type !== b.type) return false;
+  if (a.type === "LAYER_BLUR" || a.type === "BACKGROUND_BLUR") return Math.abs((a.blur || 0) - (b.blur || 0)) < 1.1;
+  if (Math.abs((a.x || 0) - (b.x || 0)) > 0.6 || Math.abs((a.y || 0) - (b.y || 0)) > 0.6) return false;
+  if (Math.abs((a.blur || 0) - (b.blur || 0)) > 0.6) return false;
+  if ((a.spread || 0) !== 0 && Math.abs((a.spread || 0) - (b.spread || 0)) > 0.6) return false;
+  return colorEq(a.color, b.color);
+}
+
 // Remove captured style properties that match the exported baseline, so an
 // update only carries what actually changed (no whole-page re-emission).
+// Properties that differ from an existing baseline are recorded in `verified`
+// so downstream gates treat them as independently confirmed changes.
 const NON_BOX_TYPES = ["ELLIPSE", "VECTOR", "STAR", "POLYGON", "LINE", "BOOLEAN_OPERATION"];
-function dropUnchangedStyle(style, original) {
+function dropUnchangedStyle(style, original, verified = new Set()) {
   const orig = normManifestStyle(original && original.style);
   if (style.fill && orig.fill && colorEq(style.fill, orig.fill)) delete style.fill;
 
-  // Gradient fill. Drop when it matches a gradient baseline stop-for-stop, or when
-  // the baseline is a solid and every captured stop is that same colour (a uniform
-  // gradient the browser renders for what Figma stores as a plain solid fill).
+  // Gradient fills. Drop when every captured layer matches the baseline layer
+  // stop-for-stop (both lists are bottom-first), or when the baseline is a
+  // solid and every captured stop is that same colour (a uniform gradient the
+  // browser renders for what Figma stores as a plain solid fill).
   if (Array.isArray(style.fills) && style.fills.length) {
-    const g = style.fills.find((f) => f && Array.isArray(f.stops)) || style.fills[0];
-    const stops = g && Array.isArray(g.stops) ? g.stops : null;
-    if (stops) {
-      if (orig.isGradient && Array.isArray(orig.gradStops)) {
-        const sig = stops.map((s) => [Number(s.position) || 0, s.r, s.g, s.b, s.a == null ? 1 : s.a]);
-        if (gradientStopsEq(sig, orig.gradStops)) delete style.fills;
-      } else if (orig.fill && stops.every((s) => colorEq({ r: s.r, g: s.g, b: s.b, a: s.a }, orig.fill))) {
+    const capturedSigs = style.fills
+      .filter((f) => f && Array.isArray(f.stops))
+      .map((f) => f.stops.map((s) => [Number(s.position) || 0, s.r, s.g, s.b, s.a == null ? 1 : s.a]));
+    if (capturedSigs.length) {
+      if (Array.isArray(orig.gradients)) {
+        const allEqual = capturedSigs.length === orig.gradients.length
+          && capturedSigs.every((sig, i) => gradientStopsEq(sig, orig.gradients[i]));
+        if (allEqual) delete style.fills;
+      } else if (orig.fill && capturedSigs.length === 1
+        && style.fills[0].stops.every((s) => colorEq({ r: s.r, g: s.g, b: s.b, a: s.a }, orig.fill))) {
         delete style.fills;
       }
     }
@@ -1420,20 +1970,93 @@ function dropUnchangedStyle(style, original) {
   } else if (!style.strokeColor && !orig.strokeColor) {
     delete style.strokeWeight;
   }
+
+  // Blend mode: baseline is always defined ('normal' when unrecorded), so a
+  // removed mix-blend-mode also diffs (captured default vs recorded mode).
+  if ("blendMode" in orig) {
+    const captured = typeof style.blendMode === "string" ? style.blendMode : "normal";
+    if (captured === orig.blendMode) delete style.blendMode;
+    else { style.blendMode = captured; verified.add("blendMode"); }
+  }
+
+  // Image scale mode: only meaningful for nodes with an image-fill baseline,
+  // and only the cover/contain (FILL/FIT) transitions are detectable — CROP
+  // and TILE render as sizes the capture cannot re-derive, so leave them be.
+  if (typeof style.scaleMode === "string") {
+    if (!("scaleMode" in orig)) delete style.scaleMode;
+    else if (style.scaleMode === orig.scaleMode) delete style.scaleMode;
+    else if (orig.scaleMode !== "FILL" && orig.scaleMode !== "FIT") delete style.scaleMode;
+    else verified.add("scaleMode");
+  }
+
+  // Effects: compare captured shadows / backdrop blur against the baseline.
+  // LAYER_BLUR never survives the DOM capture (filter:blur is not parsed
+  // back), so it is excluded from comparison and re-attached on emission to
+  // survive the plugin's wholesale effects replacement.
+  if (Array.isArray(style.effects) && Array.isArray(orig.effects)) {
+    const isShadow = (e) => e && (e.type === "DROP_SHADOW" || e.type === "INNER_SHADOW");
+    // Mirror the capture-side stroke-emulation filter on the baseline so a
+    // (rare) real zero-blur zero-offset inner shadow compares like-for-like.
+    const isStrokeEmulation = (e) => e.type === "INNER_SHADOW" && !e.blur && !e.x && !e.y;
+    const capturedShadows = style.effects.filter(isShadow).filter((e) => !isStrokeEmulation(e));
+    const capturedBlurs = style.effects.filter((e) => e && e.type === "BACKGROUND_BLUR");
+    const baseShadows = orig.effects.filter(isShadow).filter((e) => !isStrokeEmulation(e));
+    const baseBackdrop = orig.effects.filter((e) => e.type === "BACKGROUND_BLUR");
+    const baseLayerBlurs = orig.effects.filter((e) => e.type === "LAYER_BLUR");
+    const shadowsEq = capturedShadows.length === baseShadows.length
+      && capturedShadows.every((e, i) => effectSigEq(e, baseShadows[i]));
+    const blursEq = capturedBlurs.length === baseBackdrop.length
+      && capturedBlurs.every((e, i) => effectSigEq(e, baseBackdrop[i]));
+    if (shadowsEq && blursEq) {
+      delete style.effects;
+    } else {
+      for (const lb of baseLayerBlurs) style.effects.push({ type: "LAYER_BLUR", blur: lb.blur });
+      verified.add("effects");
+    }
+  }
+
+  // Text properties: compare against the export-side uniform-run baseline.
+  // Props with no baseline (mixed rich-text runs, old manifests) fall through
+  // to the conservative gating in stripUnbaselinedProps.
+  const TEXT_PROP_EQ = {
+    fontSize: (a, b) => Math.abs(a - b) < 0.6,
+    fontWeight: (a, b) => Math.abs(a - b) < 10,
+    fontFamily: (a, b) => String(a).toLowerCase() === String(b).toLowerCase(),
+    fontStyle: (a, b) => a === b,
+    letterSpacing: (a, b) => Math.abs(a - b) < 0.6,
+    lineHeightPx: (a, b) => Math.abs(a - b) < 0.6,
+    textAlign: (a, b) => a === b,
+    textDecoration: (a, b) => a === b,
+  };
+  for (const key of Object.keys(TEXT_PROP_EQ)) {
+    if (!(key in orig)) continue;
+    let cap = style[key];
+    // The capture omits default values; synthesize them so removals diff too.
+    if (cap === undefined) {
+      if (key === "fontStyle") cap = "normal";
+      else if (key === "textDecoration") cap = "none";
+      else continue;
+    }
+    if (key === "textAlign") cap = ({ start: "left", end: "right" })[cap] || cap;
+    if (TEXT_PROP_EQ[key](cap, orig[key])) delete style[key];
+    else { style[key] = cap; verified.add(key); }
+  }
   return style;
 }
 
-// Properties the manifest cannot baseline (font metadata; effects) so they can't
-// be diffed. Re-applying identical values is a pure no-op. Emit them only when
+// Fallback gate for properties whose manifest baseline may be missing (old
+// manifests, mixed rich-text runs). When dropUnchangedStyle verified a prop
+// against a real baseline it passes freely; otherwise it is only emitted when
 // the layer shows an independently-verified change (text edited, or a
-// baseline-backed property like fill/opacity/radius/layout actually differs);
-// otherwise an unchanged layer would re-emit them on every reflow.
+// baseline-backed property like fill/opacity/radius/layout actually differs),
+// so an unchanged layer does not re-emit them on every reflow.
 const UNBASELINED_PROPS = ["fontSize", "fontWeight", "fontFamily", "fontStyle", "textAlign", "lineHeightPx", "letterSpacing", "textDecoration", "effects"];
 function stripUnbaselinedProps(style, textChanged) {
   if (textChanged) return style;
+  const verified = style.__verified instanceof Set ? style.__verified : new Set();
   const keys = Object.keys(style);
-  const hasBaselineChange = keys.some((k) => UNBASELINED_PROPS.indexOf(k) === -1);
-  if (!hasBaselineChange) for (const k of keys) if (UNBASELINED_PROPS.indexOf(k) !== -1) delete style[k];
+  const hasBaselineChange = verified.size > 0 || keys.some((k) => UNBASELINED_PROPS.indexOf(k) === -1);
+  if (!hasBaselineChange) for (const k of keys) if (UNBASELINED_PROPS.indexOf(k) !== -1 && !verified.has(k)) delete style[k];
   return style;
 }
 
@@ -1444,13 +2067,54 @@ function stylePatchFromCapture(original, current) {
 
   // Only emit visual properties that actually changed from the exported baseline.
   const css = current && current.style ? current.style : {};
-  const style = cssToFigmaStyle(css, isText);
-  // Auto-layout is a create-only concern; never restructure an existing node.
-  delete style.autoLayout;
+  const style = cssToFigmaStyle(css, isText, bounds);
+  // Props confirmed changed against a real baseline land in `verified` and
+  // bypass the conservative no-baseline gates downstream.
+  const verified = new Set();
+  // Per-child layout hints are a create-only concern.
   delete style.layoutGrow;
   delete style.absolutePos;
+  // Auto-layout updates only for frames that already are auto-layout with the
+  // same direction (never restructure NONE↔flex or flip direction on update),
+  // and only when a baselined property (gap/padding/alignment) actually moved.
+  const baseAl = original && original.style && original.style.autoLayout;
+  if (style.autoLayout && baseAl && String(style.autoLayout.mode) === String(baseAl.mode)) {
+    const cap = style.autoLayout;
+    const near = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) < 0.6;
+    const alignEq = (a, b) => {
+      const norm = (v) => {
+        const s = String(v || "MIN").toUpperCase();
+        return s === "BASELINE" ? "MIN" : s;
+      };
+      return norm(a) === norm(b);
+    };
+    const same = near(cap.itemSpacing, baseAl.itemSpacing)
+      && near(cap.paddingTop, baseAl.paddingTop)
+      && near(cap.paddingRight, baseAl.paddingRight)
+      && near(cap.paddingBottom, baseAl.paddingBottom)
+      && near(cap.paddingLeft, baseAl.paddingLeft)
+      && alignEq(cap.primaryAxisAlignItems, baseAl.primaryAxisAlignItems)
+      && alignEq(cap.counterAxisAlignItems, baseAl.counterAxisAlignItems);
+    if (same) delete style.autoLayout;
+    else verified.add("autoLayout");
+  } else {
+    delete style.autoLayout;
+  }
   // Keep only properties that actually changed vs the exported baseline.
-  dropUnchangedStyle(style, original);
+  dropUnchangedStyle(style, original, verified);
+
+  // Rotation: compare the captured CSS matrix angle against the exported
+  // transform2x2 baseline (both normalized to Figma's counter-clockwise
+  // degrees). A rotated node's bounding rect is its axis-aligned envelope,
+  // so geometry diffs are skipped whenever either side is rotated.
+  const t2 = originalLayout && originalLayout.transform2x2;
+  const baseRotation = t2
+    ? -Math.round(Math.atan2(Number(t2.b) || 0, Number(t2.a) == null ? 1 : Number(t2.a)) * (180 / Math.PI) * 100) / 100
+    : 0;
+  const capRotation = typeof style.rotation === "number" ? style.rotation : 0;
+  const rotated = Math.abs(baseRotation) > 0.5 || Math.abs(capRotation) > 0.5;
+  if (Math.abs(capRotation - baseRotation) < 0.5) delete style.rotation;
+  else { style.rotation = capRotation; verified.add("rotation"); }
 
   // Layout diff. Two rules make this a real diff instead of a whole-page re-emit:
   //  - x/y only matter for absolutely-positioned nodes. Auto-layout / flow children
@@ -1472,13 +2136,15 @@ function stylePatchFromCapture(original, current) {
   const isAbsolute = String((originalLayout && originalLayout.position) || "") === "absolute";
 
   if (isText) {
-    // Only fontSize / metrics that come with a real size change survive.
+    // Metrics need either a baseline-verified change or a real size change:
+    // a fixed-width text box swallows font-size edits in its geometry, so the
+    // baseline comparison is what lets those through.
     if (!(wChanged || hChanged)) {
-      delete style.fontSize;
-      delete style.lineHeightPx;
-      delete style.letterSpacing;
+      for (const k of ["fontSize", "lineHeightPx", "letterSpacing"]) {
+        if (!verified.has(k)) delete style[k];
+      }
     }
-  } else {
+  } else if (!rotated) {
     if (wChanged) style.width = width;
     if (hChanged) style.height = height;
     if (isAbsolute) {
@@ -1487,6 +2153,28 @@ function stylePatchFromCapture(original, current) {
     }
   }
 
+  // The plugin's resolveFont() falls back to Inter when fontFamily is absent
+  // and to Regular when fontWeight is absent, so a patch touching any part of
+  // the font identity must carry all of family + weight + italic — otherwise
+  // a weight-only edit would silently reset the family.
+  if (isText && (style.fontWeight !== undefined || style.fontStyle !== undefined || style.fontFamily !== undefined)) {
+    const get = (camel, kebab) => (css[camel] != null ? css[camel] : css[kebab]);
+    if (style.fontFamily === undefined) {
+      const family = get("fontFamily", "font-family");
+      if (family) style.fontFamily = String(family).split(",")[0].replace(/["']/g, "").trim();
+    }
+    if (style.fontStyle === undefined) {
+      const fontStyleVal = get("fontStyle", "font-style");
+      style.fontStyle = fontStyleVal && /italic|oblique/i.test(String(fontStyleVal)) ? "italic" : "normal";
+    }
+    if (style.fontWeight === undefined) {
+      const fontWeight = px(get("fontWeight", "font-weight"));
+      if (fontWeight !== undefined) style.fontWeight = fontWeight;
+    }
+  }
+
+  // Non-enumerable so Object.keys/JSON never see it; read by stripUnbaselinedProps.
+  Object.defineProperty(style, "__verified", { value: verified, enumerable: false, configurable: true });
   return style;
 }
 
@@ -1500,13 +2188,19 @@ function createOperationFromCapture(item, manifest) {
   const parentY = Number(parentLayout.top ?? parentLayout.y ?? 0);
   const kind = String(item.kind || "rectangle").toLowerCase();
   const isText = kind === "text";
-  const style = Object.assign(cssToFigmaStyle(css, isText), {
+  const style = Object.assign(cssToFigmaStyle(css, isText, bounds), {
     x: Math.max(0, Number(bounds.x || 0) - parentX),
     y: Math.max(0, Number(bounds.y || 0) - parentY),
     width: Math.max(1, Number(bounds.width || 1)),
     height: Math.max(1, Number(bounds.height || 1)),
   });
-  return {
+  // Single-line text hugs its content (font-fallback metrics otherwise wrap it).
+  if (isText) {
+    const lineHeight = Number(style.lineHeightPx) || (Number(style.fontSize) || 14) * 1.6;
+    if (Number(bounds.height || 0) < lineHeight * 1.5) style.textAutoResize = "WIDTH_AND_HEIGHT";
+  }
+  const svgBgText = !isText && kind !== "svg" && item.imageSrc ? svgTextFromImageSrc(item.imageSrc) : "";
+  const op = {
     action: "create",
     id: item.createId || `html_${Date.now()}`,
     parentId,
@@ -1516,6 +2210,11 @@ function createOperationFromCapture(item, manifest) {
     imageBase64: imageBase64FromCapture(item.imageSrc),
     style
   };
+  if (svgBgText) {
+    if (op.kind === "image") op.kind = "frame";
+    op.children = [svgIconChildFromCapture(item, svgBgText)];
+  }
+  return op;
 }
 
 function makePatch(manifest, capture, options = {}) {
@@ -1607,7 +2306,7 @@ function buildPagePatch(capture, opts = {}) {
     // A node with children must be a frame (rectangles/text cannot hold children).
     if (kids.length && kind !== "frame") kind = "frame";
     const isText = kind === "text";
-    const style = cssToFigmaStyle(it.style || {}, isText);
+    const style = cssToFigmaStyle(it.style || {}, isText, b);
     const px = parentBounds ? Number(parentBounds.x || 0) : 0;
     const py = parentBounds ? Number(parentBounds.y || 0) : 0;
     style.x = Math.round((Number(b.x || 0) - px) * 100) / 100;
@@ -1623,7 +2322,11 @@ function buildPagePatch(capture, opts = {}) {
       text: it.text || "",
       style
     };
-    if (kind === "image" || (kind !== "svg" && it.imageSrc)) {
+    const svgBgText = kind !== "svg" && it.imageSrc ? svgTextFromImageSrc(it.imageSrc) : "";
+    if (svgBgText) {
+      // vector background → child icon layer; container keeps fill/radius
+      if (spec.kind === "image") spec.kind = "frame";
+    } else if (kind === "image" || (kind !== "svg" && it.imageSrc)) {
       const id = cacheImageFromCapture(it.imageSrc);
       if (id) { spec.kind = "image"; spec.imageId = id; }
       else if (kind === "image") { spec.kind = "rectangle"; } // missing image → placeholder box
@@ -1638,13 +2341,40 @@ function buildPagePatch(capture, opts = {}) {
       else { spec.kind = "rectangle"; } // missing SVG → placeholder box
     }
     const childSpecs = kids.map((k) => specFor(k, b)).filter(Boolean);
+    if (svgBgText) childSpecs.push(svgIconChildFromCapture(it, svgBgText));
     if (childSpecs.length) spec.children = childSpecs;
+
+    // Single-line text hugs its content: with a fixed captured width, any
+    // metric difference from Figma's CJK font fallback would wrap the line.
+    if (spec.kind === "text") {
+      const lineHeight = Number(spec.style.lineHeightPx) || (Number(spec.style.fontSize) || 14) * 1.6;
+      if (Number(b.height || 0) < lineHeight * 1.5) spec.style.textAutoResize = "WIDTH_AND_HEIGHT";
+    }
 
     // A container that positions any child absolutely is an overlay/positioning
     // context, not a flow layout. Auto-layout + absolute children is fragile, so
     // drop auto-layout here and keep all children at their captured x/y.
     if (spec.style.autoLayout && childSpecs.some((c) => c && c.style && c.style.absolutePos)) {
       delete spec.style.autoLayout;
+    }
+    if (spec.style.autoLayout) {
+      const al = spec.style.autoLayout;
+      // row/column-reverse: flip child order and mirror main-axis packing so
+      // visual order and anchoring match the browser.
+      if (al.reverse) {
+        childSpecs.reverse();
+        if (al.primaryAxisAlignItems === "MIN") al.primaryAxisAlignItems = "MAX";
+        else if (al.primaryAxisAlignItems === "MAX") al.primaryAxisAlignItems = "MIN";
+        delete al.reverse;
+      }
+      inferCounterAxisCenter(al, spec.style, childSpecs);
+      inferTailGrow(al, spec.style, childSpecs);
+    }
+    // Hug inference: when the container's captured size equals its flow
+    // children's extent (+gap/padding), the design intent is hug-content, so
+    // the created frame reflows when its content changes later.
+    if (spec.style.autoLayout && childSpecs.length && spec.style.autoLayout.layoutWrap !== "WRAP") {
+      inferAutoLayoutSizing(spec.style.autoLayout, spec.style, childSpecs);
     }
     return spec;
   }
@@ -2003,6 +2733,121 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ---- verify: side-by-side render loop (Figma PNG vs HTML PNG → pixel diff) ----
+
+  if (req.method === "GET" && url.pathname === "/libs/html-to-image.min.js") {
+    return sendFile(res, path.join(__dirname, "..", "vendor-figma-bridge", "public", "html-to-image.min.js"));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/render/request") {
+    try {
+      const body = await readJson(req).catch(() => ({}));
+      let nodeId = body && body.nodeId ? String(body.nodeId) : "";
+      const outDir = path.resolve((body && body.out) || defaultExportDir);
+      if (!nodeId) {
+        const manifestPath = path.join(outDir, "loop-manifest.json");
+        if (fs.existsSync(manifestPath)) {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          nodeId = Array.isArray(manifest.rootIds) && manifest.rootIds.length ? String(manifest.rootIds[0]) : "";
+        }
+      }
+      if (!nodeId) return send(res, 400, { ok: false, message: "No nodeId given and no exported manifest to take a root from." });
+      const dir = path.join(outDir, "verify");
+      ensureDir(dir);
+      renderJob = {
+        id: `render_${Date.now()}`,
+        nodeId,
+        dir,
+        requestedAt: new Date().toISOString(),
+        figmaDone: false,
+        htmlDone: false,
+      };
+      return send(res, 200, { ok: true, id: renderJob.id, nodeId, dir });
+    } catch (error) {
+      return send(res, 400, { ok: false, message: error.message });
+    }
+  }
+
+  // Polled by the plugin UI (piggybacks on its 2s pending loop).
+  if (req.method === "GET" && url.pathname === "/api/render/pending") {
+    const job = renderJob && !renderJob.figmaDone ? { id: renderJob.id, nodeId: renderJob.nodeId } : null;
+    return send(res, 200, { ok: true, job });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/render/figma") {
+    try {
+      const body = await readJson(req);
+      if (!renderJob || !body || body.id !== renderJob.id) return send(res, 409, { ok: false, message: "No matching render job." });
+      if (!body.base64) return send(res, 400, { ok: false, message: "Figma render came back empty (node not found or not exportable)." });
+      fs.writeFileSync(path.join(renderJob.dir, "figma.png"), Buffer.from(String(body.base64), "base64"));
+      renderJob.figmaDone = true;
+      return send(res, 200, { ok: true });
+    } catch (error) {
+      return send(res, 400, { ok: false, message: error.message });
+    }
+  }
+
+  // Polled by the capture client injected into the exported page.
+  if (req.method === "GET" && url.pathname === "/api/render/html-pending") {
+    const job = renderJob && !renderJob.htmlDone
+      ? { id: renderJob.id, selector: `[data-figma-id="${renderJob.nodeId}"]` }
+      : null;
+    return send(res, 200, { ok: true, job });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/render/html") {
+    try {
+      const body = await readJson(req);
+      if (!renderJob || !body || body.id !== renderJob.id) return send(res, 409, { ok: false, message: "No matching render job." });
+      const dataUrl = String(body.dataUrl || "");
+      const m = dataUrl.match(/^data:image\/png;base64,(.+)$/);
+      if (!m) return send(res, 400, { ok: false, message: "Expected a data:image/png;base64 payload." });
+      fs.writeFileSync(path.join(renderJob.dir, "html.png"), Buffer.from(m[1], "base64"));
+      renderJob.htmlDone = true;
+      return send(res, 200, { ok: true });
+    } catch (error) {
+      return send(res, 400, { ok: false, message: error.message });
+    }
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/render/status") {
+    if (!renderJob) return send(res, 404, { ok: false, message: "No render job. POST /api/render/request first." });
+    return send(res, 200, {
+      ok: true,
+      id: renderJob.id,
+      nodeId: renderJob.nodeId,
+      figmaDone: renderJob.figmaDone,
+      htmlDone: renderJob.htmlDone,
+      dir: renderJob.dir,
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/verify/compare") {
+    try {
+      const body = await readJson(req).catch(() => ({}));
+      if (!renderJob) return send(res, 404, { ok: false, message: "No render job. POST /api/render/request first." });
+      const figmaPath = path.join(renderJob.dir, "figma.png");
+      const htmlPath = path.join(renderJob.dir, "html.png");
+      if (!fs.existsSync(figmaPath)) return send(res, 409, { ok: false, message: "Figma render not received yet. Keep the plugin panel open in Figma." });
+      if (!fs.existsSync(htmlPath)) return send(res, 409, { ok: false, message: "HTML render not received yet. Keep the exported page open in the browser." });
+      const result = comparePng(fs.readFileSync(figmaPath), fs.readFileSync(htmlPath), {
+        threshold: body && Number.isFinite(Number(body.threshold)) ? Number(body.threshold) : undefined,
+      });
+      const diffPath = path.join(renderJob.dir, "diff.png");
+      fs.writeFileSync(diffPath, result.diffPng);
+      const { diffPng, ...metrics } = result;
+      return send(res, 200, {
+        ok: true,
+        ...metrics,
+        figma: figmaPath,
+        html: htmlPath,
+        diff: diffPath,
+      });
+    } catch (error) {
+      return send(res, 400, { ok: false, message: error.message });
+    }
+  }
+
   return send(res, 404, { ok: false, message: "Not found." });
 });
 
@@ -2027,6 +2872,7 @@ module.exports = {
   parseBoxShadow,
   parseLinearGradient,
   parseGradient,
+  parseGradientLayers,
   parseFilterEffects,
   parseBackdropBlur,
   gradientAngleFromDirection,
@@ -2041,6 +2887,8 @@ module.exports = {
   injectFigmaIds,
   annotateCreateIds,
   convertSegments,
+  compositionContentExtent,
+  longScreenCss,
   slugifyName,
   exportStamp,
   exportDisplayName,

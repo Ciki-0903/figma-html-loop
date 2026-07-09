@@ -100,12 +100,18 @@ function processChildNode(
 ): RenderNodeIR | null {
   if (!ch || ch.visible === false) return null;
   const isFlexItem = ctx.parentIsAutoLayout && String(ch?.layoutPositioning || 'AUTO').toUpperCase() !== 'ABSOLUTE';
+  // Absolute children get the parent box so Figma constraints can be
+  // expressed as responsive CSS (right/center/stretch/scale pins).
+  const pw = ctx.subtree?.width, ph = ctx.subtree?.height;
+  const parentSize = typeof pw === 'number' && typeof ph === 'number' ? { width: pw, height: ph } : undefined;
   const ir = nodeToIR(
     ch,
     ctx.parentForChildrenAbs,
     ctx.cssCollector,
     ctx.nextInherited,
-    isFlexItem ? { asFlexItem: true, parentAxes: ctx.parentAxes, parentAlignItemsCss: ctx.parentAlignItemsCss, parentWrap: ctx.subtree?.layoutWrap } : undefined
+    isFlexItem
+      ? { asFlexItem: true, parentAxes: ctx.parentAxes, parentAlignItemsCss: ctx.parentAlignItemsCss, parentWrap: ctx.subtree?.layoutWrap }
+      : { parentSize }
   );
   if (ir && it && typeof (it as any).itemCss === 'string' && (it as any).itemCss) {
     const extra = String((it as any).itemCss);

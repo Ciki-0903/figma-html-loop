@@ -51,6 +51,7 @@ export async function figmaSelectionToHtml(input: {
       text: node.text && typeof node.text.characters === 'string' ? node.text.characters : '',
       layout: node.layout,
       style: node.style?.raw || {},
+      ...(node.componentMeta ? { component: node.componentMeta } : {}),
     };
   }
 

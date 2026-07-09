@@ -13,10 +13,21 @@ const STYLE_WEIGHTS = [
   ["medium", 500],
   ["semibold", 600],
   ["demibold", 600],
-  ["bold", 700],
   ["extrabold", 800],
+  ["bold", 700],
   ["heavy", 900],
   ["black", 900],
+  // Chinese style names as reported by the macOS font registry (longest first
+  // so substrings like 细体/粗体 don't shadow 纤细体/中粗体).
+  ["极细体", 100],
+  ["纤细体", 200],
+  ["细体", 300],
+  ["常规体", 400],
+  ["标准体", 400],
+  ["中黑体", 500],
+  ["中粗体", 600],
+  ["特粗体", 800],
+  ["粗体", 700],
 ];
 
 function normalizeName(value) {
@@ -111,6 +122,9 @@ function systemFontRecords() {
           family: face.family || face.fullname || "",
           style: face.style || face._name || "",
           embeddable: face.embeddable !== "no",
+          // Registry typeface records carry the family/style CoreText (and
+          // therefore Figma) actually resolves, even when the file name lies.
+          origin: "registry",
         });
       }
       records.push({
@@ -119,6 +133,7 @@ function systemFontRecords() {
         family: font._name || "",
         style: font._name || "",
         embeddable: font.copy_protected !== "yes",
+        origin: "file",
       });
     }
     return records;
@@ -139,13 +154,14 @@ function buildFontIndex() {
       family: base,
       style: base,
       embeddable: true,
+      origin: "file",
     });
   }
   return records;
 }
 
 function weightDistance(record, requestedWeight) {
-  const weight = inferWeight(`${record.postscript} ${record.style}`, requestedWeight || 400);
+  const weight = inferWeight(`${record.postscript} ${record.style}`, 400);
   return Math.abs(weight - (requestedWeight || 400));
 }
 
@@ -165,7 +181,7 @@ function familyAliases(family) {
 
 function findFontFile(index, request) {
   const familyNorms = familyAliases(request.family);
-  const styleNorm = normalizeName(request.style);
+  const styleNorm = normalizeName(request.originalStyle || "");
   const candidates = index
     .filter((record) => {
       if (!record.embeddable || !record.path || !fs.existsSync(record.path)) return false;
@@ -176,6 +192,9 @@ function findFontFile(index, request) {
       const styleHaystack = normalizeName(`${record.postscript} ${record.style} ${path.basename(record.path)}`);
       let score = weightDistance(record, request.weight);
       if (styleNorm && styleHaystack.includes(styleNorm)) score -= 20;
+      // Registry records reflect how CoreText/Figma resolve the style, so
+      // prefer them over file-name guesses when everything else ties.
+      if (record.origin === "registry") score -= 2;
       const requestNorm = normalizeName(request.family);
       if (!requestNorm.includes("mono") && styleHaystack.includes("mono")) score += 100;
       if (!requestNorm.includes("rounded") && styleHaystack.includes("rounded")) score += 80;
@@ -183,6 +202,8 @@ function findFontFile(index, request) {
       if (requestNorm.startsWith("sfpro") && normalizeName(path.basename(record.path)) === "sfnsttf") score -= 50;
       if (path.extname(record.path).toLowerCase() === ".woff2") score -= 8;
       if (path.extname(record.path).toLowerCase() === ".ttf") score -= 4;
+      // Browsers can't reliably load .ttc collections via @font-face.
+      if (path.extname(record.path).toLowerCase() === ".ttc") score += 25;
       if (familyNorms.some((familyNorm) => normalizeName(path.basename(record.path)).includes(familyNorm))) score -= 3;
       return { record, score };
     })
@@ -194,11 +215,17 @@ function addRequest(map, family, weight, style) {
   if (!family) return;
   const cleanedFamily = String(family).replace(/^['"]|['"]$/g, "").trim();
   if (!cleanedFamily || /^(sans-serif|serif|monospace|system-ui|-apple-system)$/i.test(cleanedFamily)) return;
-  const key = `${cleanedFamily}|${weight || inferWeight(style)}|${style || ""}`;
+  const resolvedWeight = Number(weight) || inferWeight(style) || 400;
+  const fontStyle = /italic|oblique/i.test(String(style || "")) ? "italic" : "normal";
+  // One @font-face per (family, weight, style). A request that knows the
+  // Figma style name beats a bare numeric-weight request for the same slot.
+  const key = `${cleanedFamily.toLowerCase()}|${resolvedWeight}|${fontStyle}`;
+  const existing = map.get(key);
+  if (existing && (existing.originalStyle || !style)) return;
   map.set(key, {
     family: cleanedFamily,
-    weight: Number(weight || inferWeight(style) || 400),
-    style: /italic/i.test(String(style || "")) ? "italic" : "normal",
+    weight: resolvedWeight,
+    style: fontStyle,
     originalStyle: style || "",
   });
 }
@@ -207,11 +234,14 @@ function collectRequestedFonts(manifest, html = "", css = "") {
   const requests = new Map();
   const manifestFonts = manifest && manifest.fonts && Array.isArray(manifest.fonts.used) ? manifest.fonts.used : [];
   for (const font of manifestFonts) {
-    const styles = Array.isArray(font.styles) && font.styles.length ? font.styles : [""];
-    const weights = Array.isArray(font.weights) && font.weights.length ? font.weights : [400];
-    for (const style of styles) {
-      for (const weight of weights) addRequest(requests, font.family, weight, style);
-    }
+    const styles = Array.isArray(font.styles) ? font.styles.filter(Boolean) : [];
+    const weights = Array.isArray(font.weights) ? font.weights.filter((w) => Number(w)) : [];
+    // styles and weights are independent usage sets, not pairs; pairing them
+    // as a cross product multiplied every face into redundant requests.
+    // Each style name implies its own weight; bare weights fill the gaps.
+    for (const style of styles) addRequest(requests, font.family, inferWeight(style), style);
+    for (const weight of weights) addRequest(requests, font.family, weight, "");
+    if (!styles.length && !weights.length) addRequest(requests, font.family, 400, "");
   }
 
   const source = `${html}\n${css}`;
