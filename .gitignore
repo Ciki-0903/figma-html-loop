@@ -12,4 +12,5 @@ figma-html-loop-export/
 # Transient working artifacts
 html-capture.json
 figma-patch.json
+imports/
 *.tmp

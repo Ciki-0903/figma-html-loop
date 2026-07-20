@@ -574,11 +574,16 @@ export async function layoutToTailwindClasses(layout: LayoutInfo, extraCss: stri
   if (layout.position === 'absolute') {
     classes.add('absolute');
     omit.position = true;
-    if (typeof layout.left === 'number') {
+    // Only turn a plain numeric left/top into a utility class. When the position is
+    // constraint-derived (CENTER/MAX/SCALE set cssLeft/cssRight/cssMargin/suppress),
+    // leave it to the inline CSS path — otherwise a `left-[Npx]` class would replace
+    // the intended `left:50%` while its paired `margin-left` still applied, shifting
+    // the element by half its width.
+    if (typeof layout.left === 'number' && layout.cssLeft === undefined && !layout.suppressLeft) {
       classes.add(`left-[${fmtNum(layout.left)}px]`);
       omit.left = true;
     }
-    if (typeof layout.top === 'number') {
+    if (typeof layout.top === 'number' && layout.cssTop === undefined && !layout.suppressTop) {
       classes.add(`top-[${fmtNum(layout.top)}px]`);
       omit.top = true;
     }

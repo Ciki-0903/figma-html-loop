@@ -193,10 +193,20 @@ function applyContainerSemantics(node: FigmaNode, layout: LayoutInfo, hasWrapper
     layout.display = 'block';
   }
 
-  const pt = Number(node?.paddingTop) || 0;
-  const pr = Number(node?.paddingRight) || 0;
-  const pb = Number(node?.paddingBottom) || 0;
-  const pl = Number(node?.paddingLeft) || 0;
+  let pt = Number(node?.paddingTop) || 0;
+  let pr = Number(node?.paddingRight) || 0;
+  let pb = Number(node?.paddingBottom) || 0;
+  let pl = Number(node?.paddingLeft) || 0;
+  // Figma keeps an auto-layout frame's padding even after the frame is resized
+  // smaller than that padding — e.g. a wide button component shrunk to hug a short
+  // label reports paddingLeft/Right far larger than its own width. Figma clamps such
+  // padding when rendering; the browser would instead let it stretch the box past its
+  // real size. So when a padding pair can't fit the frame, drop it — the frame's size
+  // plus its justify/align centering already place the content correctly.
+  const nw = Number(node?.width) || 0;
+  const nh = Number(node?.height) || 0;
+  if (nw > 0 && pl + pr >= nw) { pl = 0; pr = 0; }
+  if (nh > 0 && pt + pb >= nh) { pt = 0; pb = 0; }
   if (pt || pr || pb || pl) layout.padding = { t: pt, r: pr, b: pb, l: pl };
   if (node?.strokesIncludedInLayout) layout.boxSizing = 'border-box';
   if (node?.clipsContent) layout.overflow = 'hidden';
